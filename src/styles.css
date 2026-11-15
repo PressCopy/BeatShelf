@@ -1,0 +1,227 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+
+/* Sample-browser look: a near-black canvas, one blue accent for actions.
+   Every other colour comes from the Camelot wheel (cover tiles, key chips,
+   the waveform under the playhead). Text on every surface meets WCAG AA. */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0b0d;
+  --surface: #121215;
+  --raised: #1c1c21;
+  --line: #27272e;
+  --text: #f3f3f5;
+  --muted: #a0a0ab;
+  --faint: #868692;
+  --accent: #2f6bf5;
+  --accent-hi: #7aa2ff;
+  --focus: #7aa2ff;
+  --primary-bg: #2f6bf5;
+  --primary-fg: #ffffff;
+  --warn: #e8b14f;
+  --warn-bg: rgba(232, 177, 79, 0.12);
+  --danger: #f47c7c;
+  --danger-bg: rgba(244, 124, 124, 0.12);
+  --ok: #6fd69a;
+  --row-hover: rgba(255, 255, 255, 0.045);
+  --row-selected: rgba(122, 162, 255, 0.13);
+  --wave: #62626e;
+  --key-l-minor: 64%;
+  --key-l-major: 72%;
+  --key-s: 62%;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --raised: #ececf0;
+  --line: #dadae0;
+  --text: #111114;
+  --muted: #54545e;
+  --faint: #6a6a75;
+  --accent: #2157e0;
+  --accent-hi: #1d4fd0;
+  --focus: #1d4fd0;
+  --primary-bg: #2157e0;
+  --primary-fg: #ffffff;
+  --warn: #8a5a00;
+  --warn-bg: rgba(214, 150, 30, 0.14);
+  --danger: #b42323;
+  --danger-bg: rgba(200, 40, 40, 0.1);
+  --ok: #1d7a45;
+  --row-hover: rgba(0, 0, 0, 0.035);
+  --row-selected: rgba(33, 87, 224, 0.09);
+  --wave: #8a8a96;
+  --key-l-minor: 40%;
+  --key-l-major: 46%;
+  --key-s: 60%;
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-hi: var(--accent-hi);
+  --color-focus: var(--focus);
+  --color-primary-bg: var(--primary-bg);
+  --color-primary-fg: var(--primary-fg);
+  --color-warn: var(--warn);
+  --color-warn-bg: var(--warn-bg);
+  --color-danger: var(--danger);
+  --color-danger-bg: var(--danger-bg);
+  --color-ok: var(--ok);
+  --color-wave: var(--wave);
+  /* 8pt grid; type scale 12 / 13 / 15 / 20 / 28 */
+  --text-cap: 12px;
+  --text-cap--line-height: 16px;
+  --text-body: 13px;
+  --text-body--line-height: 20px;
+  --text-sub: 15px;
+  --text-sub--line-height: 24px;
+  --text-title: 20px;
+  --text-title--line-height: 28px;
+  --text-hero: 28px;
+  --text-hero--line-height: 36px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 20px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+input,
+textarea,
+select {
+  user-select: text;
+  font: inherit;
+  color: inherit;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+}
+
+input[type="search"]::-webkit-search-cancel-button {
+  filter: grayscale(1);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 8px;
+  border: 2px solid var(--bg);
+}
+
+/* Overlays only: the one place glass is allowed. Content stays on solid panels. */
+.scrim {
+  background: rgba(4, 4, 6, 0.62);
+  backdrop-filter: blur(8px);
+}
+[data-theme="light"] .scrim {
+  background: rgba(30, 30, 40, 0.28);
+}
+
+/* Sidebar sections slide open under "Library". */
+.reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 240ms cubic-bezier(0.2, 0.9, 0.3, 1),
+    opacity 180ms ease-out;
+}
+.reveal[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.reveal > div {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* "Now playing" bars on a row's cover tile. */
+.eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+.eq i {
+  width: 3px;
+  height: 4px;
+  border-radius: 1px;
+  background: currentColor;
+  animation: eq 900ms ease-in-out infinite;
+}
+.eq i:nth-child(2) {
+  animation-delay: -300ms;
+}
+.eq i:nth-child(3) {
+  animation-delay: -600ms;
+}
+@keyframes eq {
+  0%, 100% { height: 4px; }
+  50% { height: 14px; }
+}
+
+.pop-in {
+  animation: pop-in 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+.slide-in {
+  animation: slide-in 220ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.97) translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+  .eq i {
+    animation: none;
+    height: 10px;
+  }
+}
