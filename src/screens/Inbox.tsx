@@ -6,6 +6,7 @@ import { useStore } from "../store";
 import { useDebounced, useReloadOn } from "../lib/useEvents";
 import { formatBpm, formatDate, formatSize } from "../lib/format";
 import { playNow } from "../components/Player";
+import { AddButtons } from "../components/AddButtons";
 import { Button, DawMark, Dialog, Empty, IconButton, KeyChip, Label, Segmented, TextInput } from "../components/ui";
 import { KINDS, SLOTS, voicetagAccepts, type AssetKind, type BeatRow, type InboxItem, type ItemKind, type Slot } from "../types";
 
@@ -219,7 +220,7 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
               value={slots[String(i.id)]}
               onChange={(e) => setSlots({ ...slots, [String(i.id)]: e.target.value as Slot })}
               aria-label={i.name}
-              className="h-7 rounded border border-line bg-surface px-1 outline-none focus:border-focus"
+              className="h-7 rounded border border-line bg-surface px-1 outline-none focus:border-muted"
             >
               {SLOTS.map((s) => (
                 <option key={s} value={s}>{t(`slot.${s}`)}</option>
@@ -281,6 +282,7 @@ export function Inbox() {
           <h1 className="text-title font-semibold">{t("inbox.title")}</h1>
           <p className="max-w-[72ch] text-muted">{t("inbox.hint")}</p>
         </div>
+        <AddButtons mode="inbox" />
         <Segmented
           value={ignored ? "ignored" : "pending"}
           onChange={(v) => {

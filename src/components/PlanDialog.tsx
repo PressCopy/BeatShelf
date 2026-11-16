@@ -94,6 +94,7 @@ export function PlanDialog() {
     setBusy(true);
     setError(null);
     try {
+      await req.beforeRun?.();
       const r = await api.executePlan(plan.id);
       notify(`${t("plan.done")}. ${t("plan.doneDetail", { moved: r.moved, created: r.created })}`);
       req.onDone?.();

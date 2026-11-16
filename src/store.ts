@@ -1,19 +1,38 @@
 import { create } from "zustand";
 import { api } from "./api";
 import i18n from "./i18n";
-import type { AppStateDto, Config, DropDto, ItemKind, PlanView, ThemePref } from "./types";
+import type { AppStateDto, Config, DropDto, ImportSuggest, ItemKind, PlanView, ThemePref } from "./types";
 
 export type Screen = "library" | "inbox" | "history" | "settings";
 
 /** What the player is pointed at. Either a library file or an inbox item. */
 export type PlayTarget =
-  | { type: "asset"; id: number; title: string; bpm: number | null; key: string | null; camelot: string | null; color?: string | null }
+  | {
+      type: "asset";
+      id: number;
+      title: string;
+      bpm: number | null;
+      key: string | null;
+      camelot: string | null;
+      color?: string | null;
+      /** The item the file belongs to, so the player can let go of it before the item is deleted. */
+      beatId?: number;
+    }
   | { type: "inbox"; id: number; title: string; bpm: number | null; key: string | null; camelot: string | null; color?: string | null };
+
+/** How the "where do these files go" dialog should open. */
+export interface AddFilesOptions {
+  suggest?: ImportSuggest;
+  kind?: ItemKind;
+  mode?: "new" | "beat" | "inbox";
+}
 
 interface PlanRequest {
   plan: PlanView;
   /** Called after a successful run, e.g. to clear a selection. */
   onDone?: () => void;
+  /** Runs right before the plan is executed (not when it is cancelled). */
+  beforeRun?: () => void | Promise<void>;
 }
 
 interface Store {
@@ -31,7 +50,7 @@ interface Store {
   playing: boolean;
   playProgress: number;
   /** Files waiting for "where to put them". */
-  addFiles: { drop: DropDto; beatId: number | null } | null;
+  addFiles: ({ drop: DropDto; beatId: number | null } & AddFilesOptions) | null;
   /** Beat under the cursor while files are dragged over the window. */
   dropHover: { beatId: number | null; beatName: string | null } | null;
 
@@ -41,12 +60,12 @@ interface Store {
   selectBeat: (id: number | null) => void;
   openDetail: (id: number | null) => void;
   setPlay: (p: PlayTarget | null) => void;
-  showPlan: (plan: PlanView, onDone?: () => void) => void;
+  showPlan: (plan: PlanView, onDone?: () => void, beforeRun?: () => void | Promise<void>) => void;
   closePlan: () => void;
   notify: (text: string, tone?: "ok" | "error") => void;
   setScanning: (v: boolean) => void;
   setLibraryKind: (k: ItemKind | "all") => void;
-  openAddFiles: (drop: DropDto, beatId: number | null) => void;
+  openAddFiles: (drop: DropDto, beatId: number | null, opts?: AddFilesOptions) => void;
   closeAddFiles: () => void;
   setDropHover: (h: { beatId: number | null; beatName: string | null } | null) => void;
 }
@@ -82,7 +101,7 @@ export const useStore = create<Store>((set, get) => ({
   selectBeat: (id) => set({ selectedBeatId: id }),
   openDetail: (id) => set({ detailBeatId: id }),
   setPlay: (play) => set({ play }),
-  showPlan: (plan, onDone) => set({ planRequest: { plan, onDone } }),
+  showPlan: (plan, onDone, beforeRun) => set({ planRequest: { plan, onDone, beforeRun } }),
   closePlan: () => set({ planRequest: null }),
   notify: (text, tone = "ok") => {
     clearTimeout(toastTimer);
@@ -91,7 +110,7 @@ export const useStore = create<Store>((set, get) => ({
   },
   setScanning: (scanning) => set({ scanning }),
   setLibraryKind: (libraryKind) => set({ libraryKind, detailBeatId: null }),
-  openAddFiles: (drop, beatId) => set({ addFiles: { drop, beatId } }),
+  openAddFiles: (drop, beatId, opts) => set({ addFiles: { drop, beatId, ...opts } }),
   closeAddFiles: () => set({ addFiles: null }),
   setDropHover: (dropHover) => set({ dropHover }),
 }));

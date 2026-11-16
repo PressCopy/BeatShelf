@@ -1,7 +1,7 @@
 //! Commands called from the UI. The UI refers to beats, assets, inbox items
 //! and plans by ID only; every path is resolved and checked here.
 
-use crate::state::{AfterExec, AppState, Config, NewBeatMeta, PendingPlan, WatchFolder};
+use crate::state::{AfterExec, AppState, Config, DraftFill, NewBeatMeta, PendingPlan, WatchFolder};
 use beatcore::daw::AssetKind;
 use beatcore::db::{AssetRow, BatchRow, BeatPatch, BeatRow, InboxItem, NewBeat};
 use beatcore::keys::MusicalKey;
@@ -321,13 +321,121 @@ fn kind_of(beat: &BeatRow) -> ItemKind {
     ItemKind::parse(&beat.kind).unwrap_or(ItemKind::Beat)
 }
 
+/// Where files for an existing item go. A draft (made with "New folder") has
+/// no folder yet: it gets one now, named after the first file added, unless
+/// someone already typed a name for it.
+fn existing_target(
+    tpl: &LibraryTemplate,
+    root: &Path,
+    db: &beatcore::db::Db,
+    beat: &BeatRow,
+    first: Option<&Path>,
+) -> CmdResult<(String, TokenValues, ItemKind, Option<DraftFill>)> {
+    let kind = kind_of(beat);
+    if let Some(folder) = &beat.folder {
+        return Ok((folder.clone(), values_for(beat), kind, None));
+    }
+    let (is_draft, auto_name) = db.draft_state(beat.id).map_err(err)?.unwrap_or((false, false));
+    if !is_draft {
+        return Err("this beat has no folder".into());
+    }
+    // The first file's name without its extension ("Night_140bpm_Am.wav" → "Night_140bpm_Am").
+    let stem = first
+        .map(|p| {
+            let n = if p.is_dir() { p.file_name() } else { p.file_stem() };
+            let n = n.map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if beatcore::daw::is_ableton_project_dir(p) {
+                n.strip_suffix(" Project").unwrap_or(&n).to_string()
+            } else {
+                n
+            }
+        })
+        .unwrap_or_default();
+    let parsed = parse_name(&stem);
+    let tag = kind == ItemKind::Voicetag;
+    let mut name = beat.name.clone();
+    if auto_name {
+        // BPM and key written in the file name go to their own fields, the rest is the name.
+        let from_file = if tag || parsed.title.trim().is_empty() { stem.clone() } else { parsed.title.clone() };
+        if !from_file.trim().is_empty() {
+            name = from_file.trim().to_string();
+        }
+    }
+    let bpm = if tag { None } else { beat.bpm.or(parsed.bpm.map(|b| b as f64)) };
+    let key = if tag { None } else { beat.key.as_deref().and_then(MusicalKey::parse).or(parsed.key) };
+    let mut authors = beat.authors.clone();
+    if authors.is_empty() && !tag {
+        authors = parsed.producers.clone();
+    }
+    let mut values = values_for(beat);
+    values.name = name.clone();
+    values.bpm = bpm.map(|v| v as f32);
+    values.key = key;
+    values.authors = authors.clone();
+    let mut parts = tpl.dir_for(kind, &values);
+    // A new item never merges into a folder that is already there.
+    if let Some(leaf) = parts.pop() {
+        let parent = from_rel(root, &parts.join("/"));
+        parts.push(unique_name(&parent, &leaf, &HashSet::new()));
+    }
+    Ok((parts.join("/"), values, kind, Some(DraftFill { id: beat.id, name, bpm, key, authors })))
+}
+
+/// Folder, template values and row data for an item that doesn't exist yet.
+#[allow(clippy::too_many_arguments)]
+fn new_item(
+    cfg: &Config,
+    tpl: &LibraryTemplate,
+    name: &str,
+    bpm: Option<f64>,
+    key: Option<&str>,
+    kind: Option<&str>,
+    authors: &[String],
+    coauthors: &[String],
+) -> CmdResult<(String, TokenValues, NewBeatMeta)> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    let key = key.and_then(MusicalKey::parse);
+    let kind = kind.and_then(ItemKind::parse).unwrap_or(ItemKind::Beat);
+    let mut authors = people(authors);
+    if authors.is_empty() && kind != ItemKind::Voicetag {
+        authors.extend(cfg.producer_name.clone().filter(|n| !n.trim().is_empty()));
+    }
+    let coauthors = people(coauthors);
+    let values = TokenValues {
+        name: name.into(),
+        bpm: bpm.map(|v| v as f32),
+        key,
+        date: None,
+        artist: None,
+        authors: authors.clone(),
+        coauthors: coauthors.clone(),
+    };
+    let folder = tpl.dir_for(kind, &values).join("/");
+    Ok((folder, values, NewBeatMeta { name: name.into(), bpm, key, kind, authors, coauthors }))
+}
+
 /// Database follow-up after files moved: paths, beat rows, inbox rows.
 fn after_execution(state: &AppState, cfg: &Config, report: &ops::ExecReport, after: &AfterExec) -> CmdResult<()> {
     let Ok((root, tpl)) = library(cfg) else { return Ok(()) };
     let db = state.db.lock().unwrap();
     db.apply_moves(&root, &report.movements()).map_err(err)?;
 
-    if let AfterExec::SortIntoBeat { folder, new_beat, inbox_ids } = after {
+    if let AfterExec::SortIntoBeat { folder, new_beat, inbox_ids, draft } = after {
+        if let Some(d) = draft {
+            // Before the folder is re-read below, or it would be taken for a new item.
+            db.adopt_draft(d.id, folder).map_err(err)?;
+            let patch = BeatPatch {
+                name: Some(d.name.clone()),
+                bpm: Some(d.bpm),
+                key: Some(d.key.map(|k| k.name().to_string())),
+                authors: Some(d.authors.clone()),
+                ..Default::default()
+            };
+            db.update_beat(d.id, &patch).map_err(err)?;
+        }
         if let Some(meta) = new_beat {
             match db.beat_id_by_folder(folder).map_err(err)? {
                 Some(id) => {
@@ -537,7 +645,9 @@ pub fn beat_detail(state: State<'_, AppState>, id: i64) -> CmdResult<BeatDetail>
     let current = folder.rsplit('/').next().unwrap_or("").to_string();
     let right_section = tpl.item_folder_of(&folder).map(|(_, k)| k == kind).unwrap_or(false);
     Ok(BeatDetail {
-        folder_matches_template: right_section && fold_key(Path::new(&current)) == fold_key(Path::new(&expected)),
+        // An item without a folder yet (a draft) has nothing to rename.
+        folder_matches_template: beat.folder.is_none()
+            || right_section && fold_key(Path::new(&current)) == fold_key(Path::new(&expected)),
         expected_folder_name: expected,
         expected_folder: expected_parts.join("/"),
         beat: with_abs_cover(beat, &root),
@@ -612,35 +722,19 @@ pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResul
         return Err("nothing to sort".into());
     }
 
+    let mut draft = None;
     let (folder_rel, values, new_beat, item_kind) = match &req.target {
         SortTarget::Existing { beat_id } => {
             let beat = db.get_beat(*beat_id).map_err(err)?.ok_or("beat not found")?;
-            let folder = beat.folder.clone().ok_or("this beat has no folder")?;
-            (folder, values_for(&beat), None, kind_of(&beat))
+            let first = PathBuf::from(&items[0].path);
+            let (folder, values, kind, fill) = existing_target(&tpl, &root, &db, &beat, Some(&first))?;
+            draft = fill;
+            (folder, values, None, kind)
         }
         SortTarget::New { name, bpm, key, kind, authors, coauthors } => {
-            let name = name.trim();
-            if name.is_empty() {
-                return Err("name is empty".into());
-            }
-            let key = key.as_deref().and_then(MusicalKey::parse);
-            let kind = kind.as_deref().and_then(ItemKind::parse).unwrap_or(ItemKind::Beat);
-            let mut authors = people(authors);
-            if authors.is_empty() && kind != ItemKind::Voicetag {
-                authors.extend(cfg.producer_name.clone().filter(|n| !n.trim().is_empty()));
-            }
-            let coauthors = people(coauthors);
-            let values = TokenValues {
-                name: name.into(),
-                bpm: bpm.map(|v| v as f32),
-                key,
-                date: None,
-                artist: None,
-                authors: authors.clone(),
-                coauthors: coauthors.clone(),
-            };
-            let folder = tpl.dir_for(kind, &values).join("/");
-            (folder, values, Some(NewBeatMeta { name: name.into(), bpm: *bpm, key, kind, authors, coauthors }), kind)
+            let (folder, values, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors)?;
+            let kind = meta.kind;
+            (folder, values, Some(meta), kind)
         }
     };
     drop(db);
@@ -684,7 +778,7 @@ pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResul
         b.move_item(src, dest);
     }
     let plan = b.build();
-    let after = AfterExec::SortIntoBeat { folder: folder_rel, new_beat, inbox_ids: req.inbox_ids.clone() };
+    let after = AfterExec::SortIntoBeat { folder: folder_rel, new_beat, inbox_ids: req.inbox_ids.clone(), draft };
     Ok(register(&state, plan, after, &cfg))
 }
 
@@ -949,6 +1043,18 @@ pub async fn pick_files(app: AppHandle, folders: bool, title: String) -> CmdResu
 pub enum AddTarget {
     Beat { beat_id: i64 },
     Inbox,
+    /// A new beat, loop, starter or voice tag made from these files.
+    New {
+        name: String,
+        bpm: Option<f64>,
+        key: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        authors: Vec<String>,
+        #[serde(default)]
+        coauthors: Vec<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -971,12 +1077,29 @@ pub async fn plan_add_files(state: State<'_, AppState>, req: AddFilesRequest) ->
     let paths = state.drops.lock().unwrap().get(&req.drop_id).cloned().ok_or("stale")?;
     let mut b = PlanBuilder::new(req.label, cfg.plan_roots());
     let mut taken: HashSet<String> = HashSet::new();
+    let mut after = AfterExec::Nothing;
     let beat_abs = match &req.target {
         AddTarget::Beat { beat_id } => {
-            let beat = state.db.lock().unwrap().get_beat(*beat_id).map_err(err)?.ok_or("beat not found")?;
-            Some((from_rel(&root, beat.folder.as_deref().ok_or("this beat has no folder")?), kind_of(&beat)))
+            let db = state.db.lock().unwrap();
+            let beat = db.get_beat(*beat_id).map_err(err)?.ok_or("beat not found")?;
+            let kind = kind_of(&beat);
+            // A draft is named after the first file it can actually take.
+            let first = paths.iter().find(|p| kind.accepts(kind_of_path(p), p)).or(paths.first());
+            let (folder, _, kind, fill) = existing_target(&tpl, &root, &db, &beat, first.map(|p| p.as_path()))?;
+            let abs = from_rel(&root, &folder);
+            if fill.is_some() {
+                after = AfterExec::SortIntoBeat { folder, new_beat: None, inbox_ids: vec![], draft: fill };
+            }
+            Some((abs, kind))
         }
         AddTarget::Inbox => None,
+        AddTarget::New { name, bpm, key, kind, authors, coauthors } => {
+            let (folder, _, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors)?;
+            let abs = from_rel(&root, &folder);
+            let kind = meta.kind;
+            after = AfterExec::SortIntoBeat { folder, new_beat: Some(meta), inbox_ids: vec![], draft: None };
+            Some((abs, kind))
+        }
     };
     for (i, src) in paths.iter().enumerate() {
         let dest_dir = match &beat_abs {
@@ -1002,7 +1125,7 @@ pub async fn plan_add_files(state: State<'_, AppState>, req: AddFilesRequest) ->
         taken.insert(fold_key(&dest));
         b.copy_item(src.clone(), dest);
     }
-    Ok(register(&state, b.build(), AfterExec::Nothing, &cfg))
+    Ok(register(&state, b.build(), after, &cfg))
 }
 
 #[derive(Deserialize)]
@@ -1199,7 +1322,7 @@ pub fn library_counts(state: State<'_, AppState>) -> CmdResult<HashMap<String, i
     let db = state.db.lock().unwrap();
     let mut m = HashMap::new();
     for k in ItemKind::ALL {
-        m.insert(k.as_str().to_string(), db.count_kind(k.as_str()).map_err(err)?);
+        m.insert(k.as_str().to_string(), db.count_items(k.as_str()).map_err(err)?);
     }
     Ok(m)
 }
@@ -1336,4 +1459,214 @@ pub async fn export_mp3(app: AppHandle, id: i64, title: String) -> CmdResult<Opt
     // Show the file so it can be dragged straight into a chat.
     let _ = app.opener().reveal_item_in_dir(&dest);
     Ok(dest.file_name().map(|n| n.to_string_lossy().to_string()))
+}
+
+// ───────────────────────────── "Add folder" button ─────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDto {
+    pub drop: DropDto,
+    /// Name, BPM, key and credits read from the folder or file name.
+    pub name: String,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    pub authors: Vec<String>,
+}
+
+const IMPORT_MAX_ITEMS: usize = 200;
+
+/// Pick a folder (its contents become the files of one new item) or loose
+/// files. Like every picker, it runs here: the UI gets an ID and names.
+#[tauri::command]
+pub async fn pick_import(app: AppHandle, folder: bool, title: String) -> CmdResult<Option<ImportDto>> {
+    use tauri_plugin_dialog::DialogExt;
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    let (root, _) = library(&cfg)?;
+    let dialog = app.dialog().file().set_title(title);
+
+    let (paths, source_name) = if folder {
+        let Some(picked) = dialog.blocking_pick_folder() else { return Ok(None) };
+        let dir = picked.into_path().map_err(err)?;
+        if is_within(&dir, &root) || is_within(&root, &dir) {
+            return Err("already_in_library".into());
+        }
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if beatcore::daw::is_ableton_project_dir(&dir) {
+            // An Ableton project travels as one piece.
+            let name = name.strip_suffix(" Project").unwrap_or(&name).to_string();
+            (vec![dir], name)
+        } else {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .map_err(err)?
+                .flatten()
+                .map(|e| e.path())
+                // Judge backups by the entry's own name, not by where the folder lives.
+                .filter(|p| p.file_name().map(|n| !beatcore::daw::is_backup_path(Path::new(n))).unwrap_or(false))
+                .filter(|p| !beatcore::daw::is_junk(p))
+                .collect();
+            entries.sort();
+            (entries, name)
+        }
+    } else {
+        let paths: Vec<PathBuf> =
+            dialog.blocking_pick_files().unwrap_or_default().into_iter().filter_map(|p| p.into_path().ok()).collect();
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        if paths.iter().any(|p| is_within(p, &root)) {
+            return Err("already_in_library".into());
+        }
+        let name = paths[0].file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        (paths, name)
+    };
+    if paths.len() > IMPORT_MAX_ITEMS {
+        return Err("too_many_items".into());
+    }
+    let Some(drop) = register_drop(&state, paths) else {
+        return Err("empty_folder".into());
+    };
+    let parsed = parse_name(&source_name);
+    Ok(Some(ImportDto {
+        drop,
+        name: if parsed.title.trim().is_empty() { source_name } else { parsed.title },
+        bpm: parsed.bpm.map(|b| b as f64),
+        key: parsed.key.map(|k| k.name().to_string()),
+        authors: parsed.producers,
+    }))
+}
+
+// ───────────────────────────── delete an item ─────────────────────────────
+
+/// Plan sending an item's whole folder to the OS trash. The plan carries a
+/// warning with the number of files inside, so nothing disappears unseen.
+/// The item's row goes away when the library re-reads the missing folder.
+#[tauri::command]
+pub async fn plan_delete_item(state: State<'_, AppState>, id: i64, label: String) -> CmdResult<PlanView> {
+    let cfg = state.config();
+    let (root, _) = library(&cfg)?;
+    let beat = state.db.lock().unwrap().get_beat(id).map_err(err)?.ok_or("beat not found")?;
+    let abs = from_rel(&root, beat.folder.as_deref().ok_or("no_folder")?);
+    let files = walkdir::WalkDir::new(&abs)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count();
+    let mut b = PlanBuilder::new(label, cfg.plan_roots());
+    if files > 0 {
+        b.warn(Issue::new(ops::IssueCode::DeletesFiles, &abs).detail(files.to_string()));
+    }
+    b.trash_item(abs);
+    Ok(register(&state, b.build(), AfterExec::Nothing, &cfg))
+}
+
+// ───────────────────────────── "New folder" button ─────────────────────────────
+
+/// Make an empty item. Nothing is created on disk: the folder appears, named
+/// after the first file, when files are added to it.
+#[tauri::command]
+pub fn create_item(app: AppHandle, state: State<'_, AppState>, kind: String, name: String) -> CmdResult<BeatRow> {
+    let cfg = state.config();
+    library(&cfg)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    let authors: Vec<String> = if kind == "voicetag" {
+        vec![]
+    } else {
+        cfg.producer_name.clone().filter(|n| !n.trim().is_empty()).into_iter().collect()
+    };
+    let db = state.db.lock().unwrap();
+    let id = db.create_draft(name, &kind, &authors).map_err(err)?;
+    let row = db.get_beat(id).map_err(err)?.ok_or("beat not found")?;
+    let _ = app.emit("beat-updated", id);
+    Ok(row)
+}
+
+/// Remove an empty item made by mistake. Only works while it has no folder.
+#[tauri::command]
+pub fn delete_draft(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    if !state.db.lock().unwrap().delete_draft(id).map_err(err)? {
+        return Err("not_empty".into());
+    }
+    let _ = app.emit("library-changed", ());
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod draft_target_tests {
+    use super::*;
+    use beatcore::db::Db;
+    use chrono::Datelike;
+
+    fn setup() -> (tempfile::TempDir, Db, LibraryTemplate, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let tpl = builtin_templates().remove(0);
+        let year = chrono::Local::now().year().to_string();
+        (dir, db, tpl, year)
+    }
+
+    #[test]
+    fn an_empty_item_is_named_after_its_first_file() {
+        let (dir, db, tpl, year) = setup();
+        let id = db.create_draft("Без названия", "beat", &["maks".into()]).unwrap();
+        let beat = db.get_beat(id).unwrap().unwrap();
+        let first = Path::new("C:/Downloads/Night_140bpm_Am.wav");
+        let (folder, _, kind, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
+        let fill = fill.expect("a draft is filled in");
+        assert_eq!(kind, ItemKind::Beat);
+        assert_eq!(fill.name, "Night");
+        assert_eq!(fill.bpm, Some(140.0));
+        assert_eq!(fill.key.map(|k| k.name().to_string()).as_deref(), Some("Am"));
+        assert_eq!(fill.authors, vec!["maks"]);
+        assert_eq!(folder, format!("01_Beats/{year}/Night_140bpm_Am"));
+
+        // A plain name is taken whole, minus the extension.
+        let (folder, _, _, fill) =
+            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Тёмный лес.mp3"))).unwrap();
+        assert_eq!(fill.unwrap().name, "Тёмный лес");
+        assert_eq!(folder, format!("01_Beats/{year}/Тёмный лес"));
+    }
+
+    #[test]
+    fn a_typed_name_wins_and_existing_folders_are_never_merged_into() {
+        let (dir, db, tpl, year) = setup();
+        let id = db.create_draft("Без названия", "beat", &[]).unwrap();
+        db.update_beat(id, &BeatPatch { name: Some("Мой бит".into()), ..Default::default() }).unwrap();
+        let beat = db.get_beat(id).unwrap().unwrap();
+        let first = Path::new("/x/Night_140bpm_Am.wav");
+        let (folder, _, _, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
+        let fill = fill.unwrap();
+        assert_eq!(fill.name, "Мой бит");
+        assert_eq!(fill.bpm, Some(140.0), "BPM and key are still read from the file");
+        assert_eq!(folder, format!("01_Beats/{year}/Мой бит_140bpm_Am"));
+
+        std::fs::create_dir_all(dir.path().join(&folder)).unwrap();
+        let (again, _, _, _) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
+        assert_eq!(again, format!("01_Beats/{year}/Мой бит_140bpm_Am (2)"));
+    }
+
+    #[test]
+    fn voice_tags_keep_the_whole_file_name_and_ordinary_items_are_untouched() {
+        let (dir, db, tpl, _) = setup();
+        let id = db.create_draft("Без названия", "voicetag", &[]).unwrap();
+        let beat = db.get_beat(id).unwrap().unwrap();
+        let (folder, _, kind, fill) =
+            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Maks Tag.wav"))).unwrap();
+        assert_eq!(kind, ItemKind::Voicetag);
+        assert_eq!(fill.unwrap().name, "Maks Tag");
+        assert_eq!(folder, "07_Voicetags/Maks Tag");
+
+        db.adopt_draft(id, &folder).unwrap();
+        let beat = db.get_beat(id).unwrap().unwrap();
+        let (same, _, _, fill) =
+            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Other.wav"))).unwrap();
+        assert_eq!(same, folder);
+        assert!(fill.is_none(), "an item that has a folder keeps its name");
+    }
 }

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowUpDown, Pause, Play, Search, Star } from "lucide-react";
+import { ArrowUpDown, FolderOpen, PanelRight, Pause, Play, Search, Star, Trash } from "lucide-react";
 import { api, errorText, fileUrl } from "../api";
 import { useStore, type PlayTarget } from "../store";
 import { useDebounced, useReloadOn } from "../lib/useEvents";
@@ -10,6 +10,8 @@ import { formatBpm, formatDuration, isTyping } from "../lib/format";
 import { dragOut } from "../lib/dragOut";
 import { playNow, seekTo, togglePlay } from "../components/Player";
 import { MiniWave } from "../components/MiniWave";
+import { AddButtons } from "../components/AddButtons";
+import { ContextMenu } from "../components/ContextMenu";
 import { DawMark, Empty, KeyChip, KIND_ICON } from "../components/ui";
 import { STATUSES, type BeatPatch, type BeatRow, type BeatStatus } from "../types";
 
@@ -43,7 +45,7 @@ function toPatch(field: TextField, raw: string): BeatPatch | { error: "bpm" } {
 }
 
 function playTarget(b: BeatRow): PlayTarget {
-  return { type: "asset", id: b.previewAssetId!, title: b.name, bpm: b.bpm, key: b.key, camelot: b.camelot, color: b.color };
+  return { type: "asset", id: b.previewAssetId!, title: b.name, bpm: b.bpm, key: b.key, camelot: b.camelot, color: b.color, beatId: b.id };
 }
 
 /** A value that turns into an input when clicked on the selected row
@@ -117,8 +119,8 @@ function EditableCell({
         placeholder={chip ? label : undefined}
         className={
           chip
-            ? "h-5 w-32 rounded-full border border-focus bg-bg px-2 text-cap outline-none"
-            : `h-7 rounded border border-focus bg-bg px-1.5 outline-none ${className}`
+            ? "h-5 w-32 rounded-full border border-muted bg-bg px-2 text-cap outline-none"
+            : `h-7 rounded border border-muted bg-bg px-1.5 outline-none ${className}`
         }
       />
     );
@@ -188,6 +190,10 @@ export function Library() {
   const [rows, setRows] = useState<BeatRow[] | null>(null);
   const debounced = useDebounced(query, 150);
   const reload = useReloadOn(["library-changed", "beat-updated"]);
+  const [menu, setMenu] = useState<{ x: number; y: number; beat: BeatRow } | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
+  const showPlan = useStore((s) => s.showPlan);
+  const notify = useStore((s) => s.notify);
   const searchRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -276,6 +282,34 @@ export function Library() {
     return () => window.removeEventListener("keydown", onKey);
   }, [visible, selectedId, select, openDetail, virt]);
 
+  // Delete: an empty item just goes away; a folder with files goes to the
+  // OS trash through a plan that says how many files are in it.
+  const remove = async (b: BeatRow) => {
+    const forget = () => {
+      const st = useStore.getState();
+      if (st.detailBeatId === b.id) st.openDetail(null);
+      if (st.selectedBeatId === b.id) st.selectBeat(null);
+    };
+    try {
+      if (!b.folder) {
+        await api.deleteDraft(b.id);
+        forget();
+        return;
+      }
+      const plan = await api.planDeleteItem(b.id, t("del.label", { name: b.name }));
+      showPlan(plan, forget, async () => {
+        // The player must let go of the file, or Windows won't move it to the bin.
+        const p = useStore.getState().play;
+        if (p?.type === "asset" && p.beatId === b.id) {
+          setPlay(null);
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      });
+    } catch (e) {
+      notify(errorText(e), "error");
+    }
+  };
+
   const emptyText = !rows
     ? ""
     : inKind.length === 0 && !query
@@ -287,9 +321,12 @@ export function Library() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="px-6 pb-4 pt-6">
-        <div className="mb-4 flex items-baseline gap-3">
+        <div className="mb-4 flex items-center gap-3">
           <h1 className="text-hero font-semibold tracking-tight">{title}</h1>
-          <span className="num text-muted">{rows ? countLabel : ""}</span>
+          <span className="num mt-2 text-muted">{rows ? countLabel : ""}</span>
+          <div className="ml-auto">
+            <AddButtons create />
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <label className="relative flex-1">
@@ -307,15 +344,15 @@ export function Library() {
               }}
               placeholder={t("library.search")}
               aria-label={t("library.search")}
-              className="h-10 w-full rounded-full border border-line bg-surface pl-11 pr-4 outline-none placeholder:text-faint focus:border-focus"
+              className="h-10 w-full rounded-full border border-line bg-surface pl-11 pr-4 outline-none placeholder:text-faint focus:border-muted"
             />
           </label>
           <select
             value={status}
             onChange={(e) => setStatus(e.target.value as BeatStatus | "")}
             aria-label={t("library.col.status")}
-            className={`h-10 rounded-full border bg-surface px-4 outline-none focus:border-focus ${
-              status ? "border-accent-hi text-text" : "border-line text-muted"
+            className={`h-10 rounded-full border bg-surface px-4 outline-none focus:border-muted ${
+              status ? "border-muted text-text" : "border-line text-muted"
             }`}
           >
             <option value="">{t("library.allStatuses")}</option>
@@ -329,7 +366,7 @@ export function Library() {
               value={sort}
               onChange={(e) => setSort(e.target.value as Sort)}
               aria-label={t("library.sort.label")}
-              className="h-10 rounded-full border border-line bg-surface pl-10 pr-4 text-muted outline-none focus:border-focus"
+              className="h-10 rounded-full border border-line bg-surface pl-10 pr-4 text-muted outline-none focus:border-muted"
             >
               <option value="recent">{t("library.sort.recent")}</option>
               <option value="name">{t("library.sort.name")}</option>
@@ -381,6 +418,11 @@ export function Library() {
                     data-beat-name={b.name}
                     onMouseDown={hasAudio ? dragOut({ type: "beat", id: b.id }) : undefined}
                     onClick={() => select(b)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      select(b);
+                      setMenu({ x: e.clientX, y: e.clientY, beat: b });
+                    }}
                     onDoubleClick={() => {
                       select(b);
                       if (hasAudio) playNow(playTarget(b));
@@ -438,11 +480,11 @@ export function Library() {
                             {!b.cover && (
                               <KindIcon
                                 size={16}
-                                className={selected ? "hidden" : "group-hover:hidden"}
+                                className={!hasAudio ? "" : selected ? "hidden" : "group-hover:hidden"}
                                 style={{ color: kc ?? "var(--faint)" }}
                               />
                             )}
-                            <Play size={16} className={`translate-x-[1px] ${selected ? "" : "hidden group-hover:block"}`} />
+                            {hasAudio && <Play size={16} className={`translate-x-[1px] ${selected ? "" : "hidden group-hover:block"}`} />}
                           </>
                         )}
                       </span>
@@ -469,7 +511,9 @@ export function Library() {
                           </span>
                         )}
                       </div>
-                      {tagged && (
+                      {b.folder == null ? (
+                        <div className="mt-0.5 truncate pl-1.5 text-cap text-faint">{t("draft.rowHint")}</div>
+                      ) : tagged && (
                         <div className="mt-0.5 flex min-w-0 items-center gap-1.5 overflow-hidden pl-1.5">
                           <EditableCell beat={b} field="genre" display={b.genre} chip armed={selected} onSaved={replaceRow} />
                           <EditableCell beat={b} field="mood" display={b.mood} chip armed={selected} onSaved={replaceRow} />
@@ -507,7 +551,7 @@ export function Library() {
                           onMouseDown={(e) => e.stopPropagation()}
                           onChange={async (e) => replaceRow(await api.updateBeat(b.id, { status: e.target.value as BeatStatus }))}
                           aria-label={t("library.col.status")}
-                          className="h-7 w-full rounded-full border border-line bg-transparent px-2.5 text-cap outline-none hover:border-muted focus:border-focus"
+                          className="h-7 w-full rounded-full border border-line bg-transparent px-2.5 text-cap outline-none hover:border-muted focus:border-muted"
                         >
                           {STATUSES.map((s) => (
                             <option key={s} value={s}>{t(`status.${s}`)}</option>
@@ -546,6 +590,20 @@ export function Library() {
           )}
         </div>
       </div>
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={closeMenu}
+          items={[
+            { label: t("menu.open"), icon: <PanelRight size={15} />, onSelect: () => openDetail(menu.beat.id) },
+            ...(menu.beat.folder
+              ? [{ label: t("common.reveal"), icon: <FolderOpen size={15} />, onSelect: () => void api.reveal({ type: "beat", id: menu.beat.id }) }]
+              : []),
+            { label: t("menu.delete"), icon: <Trash size={15} />, danger: true, onSelect: () => void remove(menu.beat) },
+          ]}
+        />
+      )}
     </div>
   );
 }

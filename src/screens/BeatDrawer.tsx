@@ -54,7 +54,7 @@ function PeopleField({ beat, field, label }: { beat: BeatRow; field: "authors" |
           if (e.key === "Escape") setValue(initial);
         }}
         placeholder={t("detail.peopleHint")}
-        className="h-8 w-full rounded-md border border-line bg-bg px-2.5 outline-none placeholder:text-faint focus:border-focus"
+        className="h-8 w-full rounded-md border border-line bg-bg px-2.5 outline-none placeholder:text-faint focus:border-muted"
       />
     </label>
   );
@@ -164,6 +164,15 @@ export function BeatDrawer() {
     }, wait);
   };
 
+  const removeDraft = async () => {
+    try {
+      await api.deleteDraft(beat.id);
+      close(null);
+    } catch (e) {
+      notify(errorText(e), "error");
+    }
+  };
+
   const setKind = async (kind: ItemKind) => {
     try {
       await api.updateBeat(beat.id, { kind });
@@ -212,7 +221,7 @@ export function BeatDrawer() {
           </div>
         </section>
 
-        {beat.kind !== "voicetag" && (
+        {beat.kind !== "voicetag" && beat.folder && (
           <section className="mb-6 flex gap-4">
             <div
               className="flex h-24 w-24 shrink-0 items-center justify-center overflow-hidden rounded-xl text-faint"
@@ -301,7 +310,18 @@ export function BeatDrawer() {
           </div>
         </section>
 
-        <section className="mb-6">
+        {!beat.folder && (
+          <section className="mb-6 rounded-xl border border-dashed border-line px-4 py-4">
+            <h3 className="font-semibold">{t("draft.boxTitle")}</h3>
+            <p className="mb-3 mt-1 text-muted">{t("draft.boxText")}</p>
+            <Button onClick={() => void removeDraft()}>
+              <Trash size={14} />
+              {t("draft.delete")}
+            </Button>
+          </section>
+        )}
+
+        <section className={beat.folder ? "mb-6" : "hidden"}>
           <h3 className="mb-2 font-semibold">{t("detail.folder")}</h3>
           <div className="flex items-center gap-2">
             <code className="min-w-0 flex-1 truncate text-muted" title={beat.folder ?? ""}>{beat.folder}</code>
@@ -335,7 +355,7 @@ export function BeatDrawer() {
             </IconButton>
           </div>
           {sorted.length === 0 ? (
-            <p className="text-muted">{t("detail.noFiles")}</p>
+            beat.folder && <p className="text-muted">{t("detail.noFiles")}</p>
           ) : (
             <ul className="flex flex-col">
               {sorted.map((a) => {
@@ -375,7 +395,7 @@ export function BeatDrawer() {
                       <IconButton
                         label={t("player.play")}
                         onMouseDown={(e) => e.stopPropagation()}
-                        onClick={() => playNow({ type: "asset", id: a.id, title: beat.name, bpm: beat.bpm, key: beat.key, camelot: beat.camelot, color: beat.color })}
+                        onClick={() => playNow({ type: "asset", id: a.id, title: beat.name, bpm: beat.bpm, key: beat.key, camelot: beat.camelot, color: beat.color, beatId: beat.id })}
                       >
                         <Play size={16} />
                       </IconButton>

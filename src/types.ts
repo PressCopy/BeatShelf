@@ -186,6 +186,7 @@ export type IssueCode =
   | "maybe_open_in_daw"
   | "dir_not_empty"
   | "in_trash"
+  | "deletes_files"
   | "voicetag_file_type";
 
 export interface Issue {
@@ -280,7 +281,30 @@ export type DragFilesEvent =
   | { type: "leave" }
   | { type: "drop"; x: number; y: number; drop: DropDto };
 
-export type AddTarget = { type: "beat"; beatId: number } | { type: "inbox" };
+export type AddTarget =
+  | { type: "beat"; beatId: number }
+  | { type: "inbox" }
+  | {
+      type: "new";
+      name: string;
+      bpm: number | null;
+      key: string | null;
+      kind: ItemKind;
+      authors: string[];
+      coauthors: string[];
+    };
+
+/** What the name of a picked folder or file says about the item. */
+export interface ImportSuggest {
+  name: string;
+  bpm: number | null;
+  key: string | null;
+  authors: string[];
+}
+
+export interface ImportDto extends ImportSuggest {
+  drop: DropDto;
+}
 
 export interface TemplatePatch {
   fileName?: string;

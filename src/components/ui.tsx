@@ -49,7 +49,7 @@ export function IconButton({
 export function TextInput({ className = "", ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
-      className={`h-8 w-full rounded-lg border border-line bg-surface px-2.5 text-body outline-none placeholder:text-faint focus:border-focus ${className}`}
+      className={`h-8 w-full rounded-lg border border-line bg-surface px-2.5 text-body outline-none placeholder:text-faint focus:border-muted ${className}`}
       {...rest}
     />
   );

@@ -72,6 +72,8 @@ pub enum IssueCode {
     DirNotEmpty,
     /// Undo can't pull things back out of the OS trash; restore by hand.
     InTrash,
+    /// The folder going to the trash still has files in it (`detail` = how many).
+    DeletesFiles,
 }
 
 impl IssueCode {

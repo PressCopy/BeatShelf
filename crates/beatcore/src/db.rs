@@ -9,7 +9,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/// v3: items made with the "New folder" button. `draft` = the item has no
+/// folder on disk yet; `auto_name` = its name is still the placeholder and
+/// will be taken from the first file added.
+const MIGRATION_3: &str = "
+ALTER TABLE beats ADD COLUMN draft INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE beats ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 0;
+";
 
 const SCHEMA: &str = r#"
 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -480,7 +488,10 @@ impl Db {
             conn.execute_batch(&format!("BEGIN; {SCHEMA} PRAGMA user_version = 1; COMMIT;"))?;
         }
         if version < 2 {
-            conn.execute_batch(&format!("BEGIN; {MIGRATION_2} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
+            conn.execute_batch(&format!("BEGIN; {MIGRATION_2} PRAGMA user_version = 2; COMMIT;"))?;
+        }
+        if version < 3 {
+            conn.execute_batch(&format!("BEGIN; {MIGRATION_3} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
         }
         // Batches left "running" by a crash keep their recorded ops (undoable).
         conn.execute("UPDATE batches SET status = 'failed' WHERE status = 'running'", [])?;
@@ -573,7 +584,8 @@ impl Db {
         if let Some(name) = &p.name {
             let name = name.trim();
             if !name.is_empty() {
-                tx.execute("UPDATE beats SET name = ?2 WHERE id = ?1", params![id, name])?;
+                // A name someone typed is never replaced by a file's name.
+                tx.execute("UPDATE beats SET name = ?2, auto_name = 0 WHERE id = ?1", params![id, name])?;
             }
         }
         if let Some(bpm) = p.bpm {
@@ -632,6 +644,60 @@ impl Db {
     pub fn count_kind(&self, kind: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM beats WHERE kind = ?1 AND folder IS NOT NULL",
+            [kind],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// An empty item: a row without a folder on disk. The folder appears,
+    /// named after the first file, when files are added.
+    pub fn create_draft(&self, name: &str, kind: &str, authors: &[String]) -> Result<i64> {
+        if !KINDS.contains(&kind) {
+            return Err(Error::Msg(format!("bad_kind:{kind}")));
+        }
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO beats(name, folder, status, created_at, updated_at, kind, authors, draft, auto_name)
+             VALUES (?1, NULL, ?2, ?3, ?3, ?4, ?5, 1, 1)",
+            params![name.trim(), if kind == "voicetag" { "ready" } else { "idea" }, now, kind, join_people(authors)],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// `(is a draft, name is still automatic)`.
+    pub fn draft_state(&self, id: i64) -> Result<Option<(bool, bool)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT draft, auto_name FROM beats WHERE id = ?1", [id], |r| {
+                Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
+            })
+            .optional()?)
+    }
+
+    /// The draft got its folder: from now on it is an ordinary item.
+    pub fn adopt_draft(&self, id: i64, folder: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE beats SET folder = ?2, draft = 0, auto_name = 0, updated_at = ?3 WHERE id = ?1",
+            params![id, folder, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an item that has no folder on disk (an empty draft, or a row
+    /// whose folder is gone). Refuses anything that has a folder: files are
+    /// never dropped from the library this way.
+    pub fn delete_draft(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute("DELETE FROM beats WHERE id = ?1 AND folder IS NULL", [id])?;
+        if n > 0 {
+            self.conn.execute("DELETE FROM assets WHERE beat_id = ?1", [id])?;
+        }
+        Ok(n > 0)
+    }
+
+    /// Items of a kind as the sidebar counts them: everything with a folder, plus drafts.
+    pub fn count_items(&self, kind: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM beats WHERE kind = ?1 AND (folder IS NOT NULL OR draft = 1)",
             [kind],
             |r| r.get(0),
         )?)
@@ -761,7 +827,7 @@ impl Db {
             "DELETE FROM assets WHERE NOT EXISTS (
                SELECT 1 FROM beats b WHERE b.id = assets.beat_id AND b.folder IS NOT NULL
                AND substr(assets.path, 1, length(b.folder) + 1) = b.folder || '/');
-             DELETE FROM beats WHERE folder IS NULL AND NOT EXISTS (SELECT 1 FROM assets WHERE beat_id = beats.id);",
+             DELETE FROM beats WHERE folder IS NULL AND draft = 0 AND NOT EXISTS (SELECT 1 FROM assets WHERE beat_id = beats.id);",
         )?;
         Ok(())
     }
@@ -1067,5 +1133,38 @@ mod cover_tests {
         let b = db.get_beat(id).unwrap().unwrap();
         assert_eq!(b.cover.as_deref(), Some("01_Beats/2026/Night/Artwork/Cover.JPG"));
         assert_eq!(b.cover_v, Some(5));
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    #[test]
+    fn drafts_survive_cleanup_and_become_ordinary_items() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.create_draft("Без названия", "beat", &["maks".into()]).unwrap();
+        db.prune().unwrap();
+        let b = db.get_beat(id).unwrap().expect("an empty draft is not cleaned up");
+        assert_eq!((b.name.as_str(), b.folder.as_deref(), b.kind.as_str()), ("Без названия", None, "beat"));
+        assert_eq!(db.draft_state(id).unwrap(), Some((true, true)));
+        assert_eq!(db.count_items("beat").unwrap(), 1);
+        assert_eq!(db.count_kind("beat").unwrap(), 0, "no folder yet, so it does not lock the template");
+
+        // Typing a name turns the automatic name off.
+        db.update_beat(id, &BeatPatch { name: Some("Night".into()), ..Default::default() }).unwrap();
+        assert_eq!(db.draft_state(id).unwrap(), Some((true, false)));
+
+        db.adopt_draft(id, "01_Beats/2026/Night").unwrap();
+        assert_eq!(db.draft_state(id).unwrap(), Some((false, false)));
+        assert_eq!(db.get_beat(id).unwrap().unwrap().folder.as_deref(), Some("01_Beats/2026/Night"));
+        assert!(!db.delete_draft(id).unwrap(), "an item with a folder is never deleted this way");
+        assert!(db.get_beat(id).unwrap().is_some());
+
+        let empty = db.create_draft("Без названия", "voicetag", &[]).unwrap();
+        assert_eq!(db.get_beat(empty).unwrap().unwrap().status, "ready");
+        assert!(db.delete_draft(empty).unwrap());
+        assert!(db.get_beat(empty).unwrap().is_none());
+        assert!(db.create_draft("x", "song", &[]).is_err());
     }
 }

@@ -423,3 +423,35 @@ fn library_rules_block_a_plan_even_if_the_disk_allows_it() {
     assert!(matches!(execute(&plan, &mut j, &ExecOptions::default()), Err(ExecError::Stale(_))));
     assert!(!dest.exists() && src.exists());
 }
+
+// ── Deleting an item: its folder goes to the trash through a plan ──
+
+#[test]
+fn deleting_an_item_trashes_its_folder_and_warns_about_files() {
+    let l = lib();
+    let beat = l.root.join("01_Beats/2026/Night");
+    write(&beat.join("Bounces/Night.wav"), b"RIFF");
+    write(&beat.join("Project_FL/Night.flp"), b"FLhd");
+    let other = l.root.join("01_Beats/2026/Velvet/Bounces/Velvet.wav");
+    write(&other, b"RIFF");
+
+    let mut b = PlanBuilder::new("Delete", vec![l.root.clone()]);
+    b.warn(beatcore::ops::Issue::new(IssueCode::DeletesFiles, &beat).detail("2"));
+    b.trash_item(&beat);
+    let plan = b.build();
+    assert!(plan.is_executable(), "{:?}", plan.blockers);
+    assert!(codes(&plan.warnings).contains(&IssueCode::DeletesFiles));
+
+    let mut j = MemoryJournal::default();
+    execute(&plan, &mut j, &ExecOptions::default()).unwrap();
+    assert!(!beat.exists());
+    assert!(other.exists(), "neighbours are untouched");
+
+    // Nothing outside the library can be trashed.
+    let outside = l.outside.join("keep");
+    write(&outside.join("a.wav"), b"RIFF");
+    let mut b = PlanBuilder::new("Delete", vec![l.root.clone()]);
+    b.trash_item(&outside);
+    assert!(codes(&b.build().blockers).contains(&IssueCode::OutsideLibrary));
+    assert!(outside.join("a.wav").exists());
+}

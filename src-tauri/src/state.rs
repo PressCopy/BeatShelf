@@ -83,6 +83,17 @@ impl Config {
 }
 
 #[derive(Debug, Clone)]
+/// A draft (made with "New folder") that receives its first files: the
+/// folder it gets and the fields read from the first file's name.
+pub struct DraftFill {
+    pub id: i64,
+    pub name: String,
+    pub bpm: Option<f64>,
+    pub key: Option<MusicalKey>,
+    pub authors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewBeatMeta {
     pub name: String,
     pub bpm: Option<f64>,
@@ -96,7 +107,7 @@ pub struct NewBeatMeta {
 pub enum AfterExec {
     Nothing,
     Onboarding(Config),
-    SortIntoBeat { folder: String, new_beat: Option<NewBeatMeta>, inbox_ids: Vec<i64> },
+    SortIntoBeat { folder: String, new_beat: Option<NewBeatMeta>, inbox_ids: Vec<i64>, draft: Option<DraftFill> },
 }
 
 pub struct PendingPlan {

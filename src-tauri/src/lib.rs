@@ -77,6 +77,10 @@ pub fn run() {
             commands::plan_set_cover,
             commands::plan_remove_cover,
             commands::export_mp3,
+            commands::pick_import,
+            commands::create_item,
+            commands::delete_draft,
+            commands::plan_delete_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Beatshelf");

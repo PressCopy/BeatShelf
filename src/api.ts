@@ -11,6 +11,7 @@ import type {
   Config,
   DropDto,
   ExecResult,
+  ImportDto,
   InboxItem,
   ItemKind,
   LibraryTemplate,
@@ -66,6 +67,14 @@ export const api = {
 
   /** Opens the system picker in Rust; the UI only gets an ID and file names. */
   pickFiles: (folders: boolean, title: string) => invoke<DropDto | null>("pick_files", { folders, title }),
+  /** "New folder": an empty item; its folder and name come with the first files. */
+  createItem: (kind: ItemKind, name: string) => invoke<BeatRow>("create_item", { kind, name }),
+  /** Removes an empty item (one that has no files yet). */
+  deleteDraft: (id: number) => invoke<void>("delete_draft", { id }),
+  /** Plans sending an item's whole folder to the OS trash. */
+  planDeleteItem: (id: number, label: string) => invoke<PlanView>("plan_delete_item", { id, label }),
+  /** "Add folder" / "Add files": a folder's contents (or loose files) for one new item. */
+  pickImport: (folder: boolean, title: string) => invoke<ImportDto | null>("pick_import", { folder, title }),
   planAddFiles: (req: { dropId: string; target: AddTarget; slots: Record<string, string>; label: string }) =>
     invoke<PlanView>("plan_add_files", { req }),
   /** Native drag of a library file out of the window (always a copy). */

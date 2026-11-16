@@ -17,6 +17,7 @@
   --accent: #2f6bf5;
   --accent-hi: #7aa2ff;
   --focus: #7aa2ff;
+  --ring: rgba(243, 243, 245, 0.65);
   --primary-bg: #2f6bf5;
   --primary-fg: #ffffff;
   --warn: #e8b14f;
@@ -44,6 +45,7 @@
   --accent: #2157e0;
   --accent-hi: #1d4fd0;
   --focus: #1d4fd0;
+  --ring: rgba(17, 17, 20, 0.6);
   --primary-bg: #2157e0;
   --primary-fg: #ffffff;
   --warn: #8a5a00;
@@ -132,10 +134,15 @@ input[type="search"]::-webkit-search-cancel-button {
   font-variant-numeric: tabular-nums;
 }
 
+/* No focus ring for the mouse. Tab navigation gets a neutral one
+   (main.tsx sets data-nav on <html> while the keyboard is in use). */
+:focus,
 :focus-visible {
-  outline: 2px solid var(--focus);
+  outline: none;
+}
+[data-nav="keyboard"] :focus-visible {
+  outline: 2px solid var(--ring);
   outline-offset: 1px;
-  border-radius: 6px;
 }
 
 ::-webkit-scrollbar {

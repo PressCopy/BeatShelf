@@ -32,7 +32,7 @@ export function DropLayer() {
       }
       const h = beatAt(e.x, e.y);
       st.setDropHover(null);
-      st.openAddFiles(e.drop, h.beatId);
+      st.openAddFiles(e.drop, h.beatId, h.beatId == null && st.screen === "inbox" ? { mode: "inbox" } : undefined);
     });
     return () => {
       void off.then((f) => f());

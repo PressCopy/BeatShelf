@@ -36,6 +36,7 @@ export function Player() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const autoplay = useRef(false);
+  const hadTarget = useRef(false);
   const loadedKey = useRef<string | null>(null);
 
   useEffect(() => {
@@ -101,7 +102,18 @@ export function Player() {
   // Load whatever was selected.
   useEffect(() => {
     const w = ws.current;
-    if (!w || !target) return;
+    if (!w) return;
+    if (!target) {
+      if (!hadTarget.current) return;
+      hadTarget.current = false;
+      // The item is being deleted: let go of its file.
+      w.empty();
+      setTime(0);
+      setDuration(0);
+      useStore.setState({ playing: false, playProgress: 0 });
+      return;
+    }
+    hadTarget.current = true;
     let cancelled = false;
     setError(null);
     setTime(0);

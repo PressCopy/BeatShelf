@@ -1,6 +1,6 @@
 [package]
 name = "beatshelf"
-version = "0.4.0"
+version = "0.7.0"
 description = "Beat organizer for FL Studio and Ableton Live producers"
 edition = "2021"
 license = "MIT"
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = "2.7.4"
 
 [dependencies]
-beatcore = { version = "0.4.0", path = "../crates/beatcore" }
+beatcore = { version = "0.7.0", path = "../crates/beatcore" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 drag = "2"
 log = "0.4.35"
@@ -23,3 +23,8 @@ serde_json = "1.0.154"
 tauri = { version = "2.12.5", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.8.4"
 tauri-plugin-opener = "2.7.3"
+
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
