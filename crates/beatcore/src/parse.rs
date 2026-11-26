@@ -63,7 +63,7 @@ fn tokenize(s: &str) -> Vec<Token> {
 /// Returns (key, is_plain_letter).
 fn key_from_token(t: &str) -> Option<(MusicalKey, bool)> {
     // Camelot code, uppercase letter only (avoid "1a" style noise)
-    if t.len() >= 2 && t.len() <= 3 {
+    if t.is_ascii() && (2..=3).contains(&t.len()) {
         let (digits, letter) = t.split_at(t.len() - 1);
         if (letter == "A" || letter == "B") && digits.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(n) = digits.parse::<u8>() {
@@ -187,6 +187,26 @@ pub fn parse_name(input: &str) -> ParsedName {
     let mut p = parse_core(&rest);
     p.producers = producers;
     p
+}
+
+/// A project folder may put producer handles before a spaced dash. Keep
+/// other uses of @ (including a handle inside a title) as ordinary text.
+pub fn parse_folder_name(input: &str) -> ParsedName {
+    for delimiter in [" - ", " — ", " – "] {
+        if let Some((prefix, title)) = input.split_once(delimiter) {
+            let handles: Vec<_> = prefix.split_whitespace().collect();
+            if !title.trim().is_empty() && !handles.is_empty() && handles.iter().all(|h| {
+                h.strip_prefix('@').is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            }) {
+                let mut parsed = parse_name(title);
+                let mut producers: Vec<_> = handles.into_iter().map(str::to_owned).collect();
+                producers.append(&mut parsed.producers);
+                parsed.producers = producers;
+                return parsed;
+            }
+        }
+    }
+    parse_name(input)
 }
 
 fn parse_core(input: &str) -> ParsedName {
@@ -404,6 +424,15 @@ mod tests {
         assert_eq!((p.title.as_str(), p.bpm, p.key), ("Ночь", Some(140.0), k("Am")));
         let p = parse_name("Зима 128 BPM");
         assert_eq!((p.title.as_str(), p.bpm), ("Зима", Some(128.0)));
+    }
+
+    #[test]
+    fn folder_handles_and_unicode_punctuation() {
+        let p = parse_folder_name("@presscopy @prodamory — Alice 130 Gm");
+        assert_eq!(p.producers, vec!["@presscopy", "@prodamory"]);
+        assert_eq!((p.title.as_str(), p.bpm, p.key), ("Alice", Some(130.0), k("Gm")));
+        let p = parse_folder_name("Night — final");
+        assert_eq!((p.bpm, p.key), (None, None));
     }
 
     #[test]

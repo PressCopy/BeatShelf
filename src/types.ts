@@ -64,6 +64,8 @@ export interface Config {
   lang: Lang;
   theme: ThemePref;
   showBackups: boolean;
+  numberFrom: number;
+  numberBeats: boolean;
   producerName: string | null;
 }
 
@@ -145,12 +147,13 @@ export interface AssetRow {
 export interface BeatDetail {
   beat: BeatRow;
   assets: AssetRow[];
-  folderMatchesTemplate: boolean;
-  expectedFolderName: string;
+  wrongSection: boolean;
   expectedFolder: string;
 }
 
 export interface InboxItem {
+  folderName: string | null;
+  authors: string[];
   id: number;
   path: string;
   name: string;
@@ -250,7 +253,6 @@ export type SortTarget =
 export interface SortRequest {
   inboxIds: number[];
   target: SortTarget;
-  rename: boolean;
   slots: Record<string, Slot>;
   label: string;
 }
@@ -272,6 +274,7 @@ export interface DropItem {
 }
 
 export interface DropDto {
+  folderSuggestion: ImportSuggest | null;
   dropId: string;
   items: DropItem[];
 }
@@ -296,6 +299,7 @@ export type AddTarget =
 
 /** What the name of a picked folder or file says about the item. */
 export interface ImportSuggest {
+  userFolder: string;
   name: string;
   bpm: number | null;
   key: string | null;

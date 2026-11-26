@@ -58,7 +58,7 @@
 
 ## Установка
 
-Скачай файл для своей системы со страницы **Releases**. Сборки пока без подписи, поэтому система при первом запуске спросит, доверяешь ли ты приложению.
+Скачай файл для своей системы со [страницы последней версии](https://github.com/PressCopy/BeatShelf/releases/latest). Сборки пока без подписи, поэтому система при первом запуске спросит, доверяешь ли ты приложению.
 
 **Windows.** Запусти `Beatshelf_x.y.z_x64-setup.exe` (или `arm64`). Если появится «Windows защитила ваш компьютер», нажми «Подробнее» → «Выполнить в любом случае».
 
@@ -75,15 +75,7 @@ xattr -dr com.apple.quarantine /Applications/Beatshelf.app
 
 ## Сборка релиза через GitHub
 
-1. Залей репозиторий на GitHub.
-2. Поставь тег версии и отправь его:
-   ```sh
-   git tag v0.1.0 && git push origin v0.1.0
-   ```
-3. Workflow **Release** соберёт macOS (универсальный: Apple Silicon + Intel), Windows x64 (MSI и NSIS) и Windows ARM64 (NSIS). Результат появится черновиком в Releases.
-4. Проверь черновик и нажми «Publish».
-
-Версия берётся из `src-tauri/tauri.conf.json`. Меняй её вместе с `package.json` и `Cargo.toml`.
+Обнови версию в манифестах Tauri, npm и Cargo и соответствующих lock-файлах. При отправке новой версии в `main` GitHub Actions собирает установщики для Windows x64, Windows ARM64 и macOS (Apple Silicon и Intel). После успешной сборки всех платформ workflow публикует файлы в GitHub Releases. Постоянная ссылка для скачивания находится в разделе «Установка».
 
 Workflow **CI** на каждый push гоняет тесты ядра на трёх ОС и проверяет, что приложение собирается.
 

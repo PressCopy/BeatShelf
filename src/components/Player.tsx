@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import WaveSurfer from "wavesurfer.js";
-import { Pause, Play } from "lucide-react";
-import { api, errorText, fileUrl } from "../api";
+import { Pause, Play, Volume2 } from "lucide-react";
+import { api, errorText, fileUrl, onEvent } from "../api";
 import { useStore, type PlayTarget } from "../store";
 import { beatColor } from "../lib/camelot";
 import { formatBpm, formatTime, isTyping } from "../lib/format";
@@ -30,6 +30,7 @@ export function Player() {
   const target = useStore((s) => s.play);
   const container = useRef<HTMLDivElement>(null);
   const ws = useRef<WaveSurfer | null>(null);
+  const [volume, setVolume] = useState(100);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -99,7 +100,30 @@ export function Player() {
     };
   }, []);
 
-  // Load whatever was selected.
+  useEffect(() => { ws.current?.setVolume(volume / 100); }, [volume]);
+  useEffect(() => {
+    let active = true;
+    let revision = 0;
+    const off = onEvent<number>("beat-updated", async (id) => {
+      const p = useStore.getState().play;
+      if (p?.type !== "asset" || p.beatId !== id) return;
+      const seq = ++revision;
+      try {
+        const { beat } = await api.beatDetail(id);
+        const current = useStore.getState().play;
+        if (!active || seq !== revision || current?.type !== "asset" || current.beatId !== id) return;
+        useStore.getState().setPlay({ ...current, title: beat.name, bpm: beat.bpm, key: beat.key, camelot: beat.camelot, color: beat.color });
+      } catch { /* The item may have been removed. */ }
+    });
+    return () => { active = false; void off.then((stop) => stop()); };
+  }, []);
+
+  useEffect(() => {
+    const c = waveColors(target?.camelot ?? null, target?.color);
+    ws.current?.setOptions({ waveColor: c.wave, progressColor: c.progress, cursorColor: c.cursor });
+  }, [target?.color, target?.camelot]);
+
+  // Only a change of media identity loads a new audio file.
   useEffect(() => {
     const w = ws.current;
     if (!w) return;
@@ -115,20 +139,29 @@ export function Player() {
     }
     hadTarget.current = true;
     let cancelled = false;
+    const controller = new AbortController();
     setError(null);
     setTime(0);
     useStore.setState({ playProgress: 0 });
     setLoading(true);
     loadedKey.current = null;
-    const c = waveColors(target.camelot, target.color);
-    w.setOptions({ waveColor: c.wave, progressColor: c.progress, cursorColor: c.cursor });
     const fetchMedia = target.type === "asset" ? api.assetMedia(target.id) : api.inboxMedia(target.id);
     fetchMedia
-      .then((m) => {
+      .then(async (m) => {
         if (cancelled) return;
         const dur = m.durationMs != null ? m.durationMs / 1000 : undefined;
         if (dur) setDuration(dur);
-        return w.load(fileUrl(m.path), m.peaks.length ? [m.peaks] : undefined, dur);
+        const url = fileUrl(m.path);
+        const peaks = m.peaks.length ? [m.peaks] : undefined;
+        if (useStore.getState().app?.platform === "linux" && url.startsWith("asset:")) {
+          // WebKitGTK can fetch Tauri assets but GStreamer cannot stream that URI scheme.
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(response.statusText);
+          const blob = await response.blob();
+          if (!cancelled) await w.loadBlob(blob, peaks, dur);
+        } else {
+          await w.load(url, peaks, dur);
+        }
       })
       .catch((e) => {
         if (!cancelled) {
@@ -138,8 +171,9 @@ export function Player() {
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [target]);
+  }, [target?.type, target?.id]);
 
   // Keyboard transport. Ignored while typing or when a dialog is open.
   useEffect(() => {
@@ -210,7 +244,7 @@ export function Player() {
   }, []);
 
   return (
-    <footer className="grid h-[72px] shrink-0 grid-cols-[minmax(220px,300px)_1fr_auto] items-center gap-5 border-t border-line bg-surface px-5">
+    <footer className="grid h-[72px] shrink-0 grid-cols-[minmax(220px,300px)_1fr_auto_auto] items-center gap-5 border-t border-line bg-surface px-5">
       <div className="flex min-w-0 items-center gap-3">
         <button
           type="button"
@@ -240,6 +274,12 @@ export function Player() {
       <div className="num w-24 text-right text-muted">
         {target ? `${formatTime(time)} / ${formatTime(duration)}` : ""}
       </div>
+      <label className="flex items-center gap-2 text-muted" title={t("player.volume") + " · " + volume + "%"}>
+        <Volume2 size={15} aria-hidden="true" />
+        <input type="range" min={0} max={100} step={1} value={volume}
+          aria-label={t("player.volume")} aria-valuetext={volume + "%"}
+          className="w-20 accent-[var(--accent-hi)]" onChange={(e) => setVolume(Number(e.target.value))} />
+      </label>
     </footer>
   );
 }

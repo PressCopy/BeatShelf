@@ -9,7 +9,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const MIGRATION_4: &str = "
+ALTER TABLE beats ADD COLUMN service_folder TEXT;
+ALTER TABLE beats ADD COLUMN bpm_edited INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE beats ADD COLUMN key_edited INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inbox ADD COLUMN folder_name TEXT;
+CREATE UNIQUE INDEX beats_service ON beats(service_folder) WHERE service_folder IS NOT NULL;
+";
 
 /// v3: items made with the "New folder" button. `draft` = the item has no
 /// folder on disk yet; `auto_name` = its name is still the placeholder and
@@ -234,7 +241,7 @@ pub struct NewBeat {
     pub name: String,
     pub folder: Option<String>,
     pub bpm: Option<f64>,
-    pub key: Option<MusicalKey>,
+    pub key: Option<String>,
     pub status: Option<String>,
     /// "beat" when empty.
     pub kind: Option<String>,
@@ -280,6 +287,8 @@ pub struct AssetUpsert {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxItem {
+    pub folder_name: Option<String>,
+    pub authors: Vec<String>,
     pub id: i64,
     pub path: String,
     pub name: String,
@@ -300,6 +309,7 @@ pub struct InboxItem {
 
 #[derive(Debug, Clone, Default)]
 pub struct InboxUpsert {
+    pub folder_name: Option<String>,
     pub path: String,
     pub source: String,
     pub kind: String,
@@ -335,10 +345,8 @@ fn file_name_of(rel: &str) -> String {
 }
 
 fn key_fields(key: Option<&str>) -> (Option<String>, Option<String>) {
-    match key.and_then(MusicalKey::parse) {
-        Some(k) => (Some(k.name().to_string()), Some(k.camelot_code())),
-        None => (None, None),
-    }
+    let raw = key.filter(|value| !value.is_empty());
+    (raw.map(str::to_owned), raw.and_then(MusicalKey::parse).map(|k| k.camelot_code()))
 }
 
 /// Turn free text into an FTS5 prefix query plus numeric BPM terms.
@@ -440,14 +448,18 @@ fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
     })
 }
 
-const INBOX_SELECT: &str = "SELECT id, path, source, kind, daw, is_dir, size, mtime, title, bpm, musical_key, tagged, state, detected_at FROM inbox";
+const INBOX_SELECT: &str = "SELECT id, path, source, kind, daw, is_dir, size, mtime, title, bpm, musical_key, tagged, state, detected_at, folder_name FROM inbox";
 
 fn inbox_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboxItem> {
     let path: String = r.get(1)?;
     let key: Option<String> = r.get(10)?;
     let camelot = key.as_deref().and_then(MusicalKey::parse).map(|k| k.camelot_code());
     let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let folder_name: Option<String> = r.get(14)?;
+    let authors = folder_name.as_deref().map(crate::parse::parse_folder_name).map(|p| p.producers).unwrap_or_default();
     Ok(InboxItem {
+        folder_name,
+        authors,
         id: r.get(0)?,
         name,
         path,
@@ -491,7 +503,10 @@ impl Db {
             conn.execute_batch(&format!("BEGIN; {MIGRATION_2} PRAGMA user_version = 2; COMMIT;"))?;
         }
         if version < 3 {
-            conn.execute_batch(&format!("BEGIN; {MIGRATION_3} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
+            conn.execute_batch(&format!("BEGIN; {MIGRATION_3} PRAGMA user_version = 3; COMMIT;"))?;
+        }
+        if version < 4 {
+            conn.execute_batch(&format!("BEGIN; {MIGRATION_4} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
         }
         // Batches left "running" by a crash keep their recorded ops (undoable).
         conn.execute("UPDATE batches SET status = 'failed' WHERE status = 'running'", [])?;
@@ -528,8 +543,8 @@ impl Db {
                 b.name,
                 b.folder,
                 b.bpm,
-                b.key.map(|k| k.name().to_string()),
-                b.key.map(|k| k.camelot_code()),
+                b.key,
+                b.key.as_deref().and_then(MusicalKey::parse).map(|k| k.camelot_code()),
                 b.status.clone().unwrap_or_else(|| "idea".into()),
                 now,
                 b.kind.clone().filter(|k| KINDS.contains(&k.as_str())).unwrap_or_else(|| "beat".into()),
@@ -538,6 +553,18 @@ impl Db {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_service(&self, id: i64, service: &str) -> Result<()> {
+        self.conn.execute("UPDATE beats SET service_folder = ?2 WHERE id = ?1", params![id, service])?;
+        Ok(())
+    }
+
+    pub fn service_user(&self, service: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT folder FROM beats WHERE service_folder = ?1 AND folder IS NOT NULL",
+            [service], |r| r.get(0),
+        ).optional()?)
     }
 
     pub fn beat_id_by_folder(&self, folder: &str) -> Result<Option<i64>> {
@@ -557,7 +584,7 @@ impl Db {
     pub fn list_beats(&self, query: &str) -> Result<Vec<BeatRow>> {
         let (fts, nums) = split_query(query);
         let mut sql = String::from(BEAT_SELECT);
-        let mut conds: Vec<String> = vec!["b.folder IS NOT NULL".into()];
+        let mut conds: Vec<String> = vec!["(b.folder IS NOT NULL OR b.draft = 1)".into()];
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         if !fts.is_empty() {
             args.push(fts.into());
@@ -568,7 +595,7 @@ impl Db {
             let i = args.len();
             // A number matches the BPM, or a word in the name ("Beat 2").
             conds.push(format!(
-                "(CAST(round(b.bpm) AS INTEGER) = ?{i} OR (' ' || b.name || ' ') LIKE '% ' || ?{i} || ' %')"
+                "(CAST(round(b.bpm) AS INTEGER) = ?{i} OR b.musical_key = CAST(?{i} AS TEXT) OR (' ' || b.name || ' ') LIKE '% ' || ?{i} || ' %')"
             ));
         }
         sql.push_str(" WHERE ");
@@ -580,63 +607,57 @@ impl Db {
     }
 
     pub fn update_beat(&self, id: i64, p: &BeatPatch) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.conn.is_autocommit().then(|| self.conn.unchecked_transaction()).transpose()?;
         if let Some(name) = &p.name {
             let name = name.trim();
             if !name.is_empty() {
                 // A name someone typed is never replaced by a file's name.
-                tx.execute("UPDATE beats SET name = ?2, auto_name = 0 WHERE id = ?1", params![id, name])?;
+                self.conn.execute("UPDATE beats SET name = ?2, auto_name = 0 WHERE id = ?1", params![id, name])?;
             }
         }
         if let Some(bpm) = p.bpm {
             let bpm = bpm.filter(|v| (20.0..=999.0).contains(v));
-            tx.execute("UPDATE beats SET bpm = ?2 WHERE id = ?1", params![id, bpm])?;
+            self.conn.execute("UPDATE beats SET bpm = ?2, bpm_edited = 1 WHERE id = ?1", params![id, bpm])?;
         }
         if let Some(key) = &p.key {
-            // A typo must not silently wipe the key: reject what we can't read.
-            if let Some(raw) = key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                if MusicalKey::parse(raw).is_none() {
-                    return Err(Error::Msg(format!("bad_key:{raw}")));
-                }
-            }
             let (name, camelot) = key_fields(key.as_deref());
-            tx.execute("UPDATE beats SET musical_key = ?2, camelot = ?3 WHERE id = ?1", params![id, name, camelot])?;
+            self.conn.execute("UPDATE beats SET musical_key = ?2, camelot = ?3, key_edited = 1 WHERE id = ?1", params![id, name, camelot])?;
         }
         let clean = |v: &Option<String>| v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         if let Some(v) = &p.genre {
-            tx.execute("UPDATE beats SET genre = ?2 WHERE id = ?1", params![id, clean(v)])?;
+            self.conn.execute("UPDATE beats SET genre = ?2 WHERE id = ?1", params![id, clean(v)])?;
         }
         if let Some(v) = &p.mood {
-            tx.execute("UPDATE beats SET mood = ?2 WHERE id = ?1", params![id, clean(v)])?;
+            self.conn.execute("UPDATE beats SET mood = ?2 WHERE id = ?1", params![id, clean(v)])?;
         }
         if let Some(v) = &p.type_beat {
-            tx.execute("UPDATE beats SET type_beat = ?2 WHERE id = ?1", params![id, clean(v)])?;
+            self.conn.execute("UPDATE beats SET type_beat = ?2 WHERE id = ?1", params![id, clean(v)])?;
         }
         if let Some(s) = &p.status {
             if STATUSES.contains(&s.as_str()) {
-                tx.execute("UPDATE beats SET status = ?2 WHERE id = ?1", params![id, s])?;
+                self.conn.execute("UPDATE beats SET status = ?2 WHERE id = ?1", params![id, s])?;
             }
         }
         if let Some(r) = p.rating {
-            tx.execute("UPDATE beats SET rating = ?2 WHERE id = ?1", params![id, r.clamp(0, 5)])?;
+            self.conn.execute("UPDATE beats SET rating = ?2 WHERE id = ?1", params![id, r.clamp(0, 5)])?;
         }
         if let Some(c) = &p.color {
-            tx.execute("UPDATE beats SET color = ?2 WHERE id = ?1", params![id, clean(c)])?;
+            self.conn.execute("UPDATE beats SET color = ?2 WHERE id = ?1", params![id, clean(c)])?;
         }
         if let Some(kind) = &p.kind {
             if !KINDS.contains(&kind.as_str()) {
                 return Err(Error::Msg(format!("bad_kind:{kind}")));
             }
-            tx.execute("UPDATE beats SET kind = ?2 WHERE id = ?1", params![id, kind])?;
+            self.conn.execute("UPDATE beats SET kind = ?2 WHERE id = ?1", params![id, kind])?;
         }
         if let Some(a) = &p.authors {
-            tx.execute("UPDATE beats SET authors = ?2 WHERE id = ?1", params![id, join_people(a)])?;
+            self.conn.execute("UPDATE beats SET authors = ?2 WHERE id = ?1", params![id, join_people(a)])?;
         }
         if let Some(a) = &p.coauthors {
-            tx.execute("UPDATE beats SET coauthors = ?2 WHERE id = ?1", params![id, join_people(a)])?;
+            self.conn.execute("UPDATE beats SET coauthors = ?2 WHERE id = ?1", params![id, join_people(a)])?;
         }
-        tx.execute("UPDATE beats SET updated_at = ?2 WHERE id = ?1", params![id, now_ts()])?;
-        tx.commit()?;
+        self.conn.execute("UPDATE beats SET updated_at = ?2 WHERE id = ?1", params![id, now_ts()])?;
+        if let Some(tx) = tx { tx.commit()?; }
         Ok(())
     }
 
@@ -672,6 +693,11 @@ impl Db {
                 Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
             })
             .optional()?)
+    }
+
+    pub fn draft_edits(&self, id: i64) -> Result<(bool, bool)> {
+        Ok(self.conn.query_row("SELECT bpm_edited, key_edited FROM beats WHERE id=?1", [id],
+            |r| Ok((r.get(0)?, r.get(1)?)))?)
     }
 
     /// The draft got its folder: from now on it is an ordinary item.
@@ -788,14 +814,14 @@ impl Db {
 
     /// Keep relative paths in step with files moved on disk.
     pub fn apply_moves(&self, root: &Path, moves: &[(PathBuf, PathBuf)]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.conn.is_autocommit().then(|| self.conn.unchecked_transaction()).transpose()?;
         for (from, to) in moves {
             let (Some(rf), rt) = (rel_string(root, from), rel_string(root, to)) else { continue };
             match rt {
                 Some(rt) => {
-                    for table_col in [("assets", "path"), ("beats", "folder")] {
+                    for table_col in [("assets", "path"), ("beats", "folder"), ("beats", "service_folder")] {
                         let (t, c) = table_col;
-                        tx.execute(
+                        self.conn.execute(
                             &format!(
                                 "UPDATE {t} SET {c} = ?2 || substr({c}, length(?1) + 1)
                                  WHERE {c} = ?1 OR substr({c}, 1, length(?1) + 1) = ?1 || '/'"
@@ -805,18 +831,18 @@ impl Db {
                     }
                 }
                 None => {
-                    tx.execute(
+                    self.conn.execute(
                         "DELETE FROM assets WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
                         [&rf],
                     )?;
-                    tx.execute(
+                    self.conn.execute(
                         "UPDATE beats SET folder = NULL WHERE folder = ?1 OR substr(folder, 1, length(?1) + 1) = ?1 || '/'",
                         [&rf],
                     )?;
                 }
             }
         }
-        tx.commit()?;
+        if let Some(tx) = tx { tx.commit()?; }
         Ok(())
     }
 
@@ -840,33 +866,24 @@ impl Db {
 
     // ── inbox ──
     pub fn upsert_inbox(&self, i: &InboxUpsert) -> Result<bool> {
-        let existing: Option<(Option<i64>, Option<i64>, String)> = self
-            .conn
-            .query_row("SELECT size, mtime, state FROM inbox WHERE path = ?1", [&i.path], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .optional()?;
-        match existing {
-            Some((size, mtime, _)) if size == i.size && mtime == i.mtime => Ok(false),
-            Some((_, _, state)) => {
-                self.conn.execute(
-                    "UPDATE inbox SET size = ?2, mtime = ?3, kind = ?4, daw = ?5, is_dir = ?6 WHERE path = ?1",
-                    params![i.path, i.size, i.mtime, i.kind, i.daw, i.is_dir],
-                )?;
-                Ok(state == "pending")
-            }
-            None => {
-                self.conn.execute(
-                    "INSERT INTO inbox(path, source, kind, daw, is_dir, size, mtime, title, bpm, musical_key, tagged, state, detected_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12)",
-                    params![
-                        i.path, i.source, i.kind, i.daw, i.is_dir, i.size, i.mtime, i.title, i.bpm, i.key, i.tagged,
-                        now_ts()
-                    ],
-                )?;
-                Ok(true)
-            }
-        }
+        let changed = self.conn.execute(
+            "INSERT INTO inbox(path, source, kind, daw, is_dir, size, mtime, title, bpm, musical_key, tagged, state, detected_at, folder_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)
+             ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, kind=excluded.kind,
+               daw=excluded.daw, is_dir=excluded.is_dir, title=excluded.title, bpm=excluded.bpm,
+               musical_key=excluded.musical_key, tagged=excluded.tagged, folder_name=excluded.folder_name
+             WHERE (inbox.size, inbox.mtime, inbox.kind, inbox.daw, inbox.is_dir, inbox.title, inbox.bpm, inbox.musical_key, inbox.tagged, inbox.folder_name)
+                IS NOT (excluded.size, excluded.mtime, excluded.kind, excluded.daw, excluded.is_dir, excluded.title, excluded.bpm, excluded.musical_key, excluded.tagged, excluded.folder_name)",
+            params![i.path, i.source, i.kind, i.daw, i.is_dir, i.size, i.mtime, i.title, i.bpm, i.key, i.tagged, now_ts(), i.folder_name],
+        )?;
+        let nested = if i.kind == "ableton_project" {
+            // A Live set can be detected before Live finishes creating its
+            // project structure. The settled project supersedes those files.
+            let prefix = format!("{}{}", i.path, std::path::MAIN_SEPARATOR);
+            self.conn.execute("DELETE FROM inbox WHERE source IN ('fl','ableton')
+                AND substr(path,1,length(?1))=?1", [prefix])?
+        } else { 0 };
+        Ok(changed != 0 || nested != 0)
     }
 
     pub fn list_inbox(&self, state: &str) -> Result<Vec<InboxItem>> {
@@ -986,7 +1003,7 @@ mod tests {
                 name: "Night Drive".into(),
                 folder: Some("01_Beats/2026/Night_140bpm_Am".into()),
                 bpm: Some(140.0),
-                key: MusicalKey::parse("Am"),
+                key: Some("Am".into()),
                 status: None,
                 ..Default::default()
             })
@@ -1045,14 +1062,16 @@ mod key_validation_tests {
     use super::*;
 
     #[test]
-    fn bad_key_is_rejected_and_old_value_kept() {
+    fn free_key_retains_spelling_and_only_recognised_values_get_camelot() {
         let db = Db::open_in_memory().unwrap();
-        let id = db
-            .create_beat(&NewBeat { name: "Night".into(), folder: Some("01_Beats/Night".into()), key: MusicalKey::parse("Am"), ..Default::default() })
-            .unwrap();
-        let err = db.update_beat(id, &BeatPatch { key: Some(Some("Q#z".into())), ..Default::default() });
-        assert!(matches!(err, Err(Error::Msg(m)) if m.starts_with("bad_key:")));
-        assert_eq!(db.get_beat(id).unwrap().unwrap().key.as_deref(), Some("Am"));
+        let id = db.create_draft("Night", "beat", &[]).unwrap();
+        for (value, code) in [("A Minor", Some("8A")), ("8a", Some("8A")), ("Ля / минор", None), ("123", None)] {
+            db.update_beat(id, &BeatPatch { key: Some(Some(value.into())), ..Default::default() }).unwrap();
+            let row = db.get_beat(id).unwrap().unwrap();
+            assert_eq!(row.key.as_deref(), Some(value));
+            assert_eq!(row.camelot.as_deref(), code);
+        }
+        assert_eq!(db.list_beats("123").unwrap()[0].id, id);
         db.update_beat(id, &BeatPatch { key: Some(None), ..Default::default() }).unwrap();
         assert_eq!(db.get_beat(id).unwrap().unwrap().key, None);
     }
@@ -1145,6 +1164,7 @@ mod draft_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db.create_draft("Без названия", "beat", &["maks".into()]).unwrap();
         db.prune().unwrap();
+        assert_eq!(db.list_beats("").unwrap()[0].id, id);
         let b = db.get_beat(id).unwrap().expect("an empty draft is not cleaned up");
         assert_eq!((b.name.as_str(), b.folder.as_deref(), b.kind.as_str()), ("Без названия", None, "beat"));
         assert_eq!(db.draft_state(id).unwrap(), Some((true, true)));

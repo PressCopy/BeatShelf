@@ -156,11 +156,12 @@ export function KeyChip({ keyName, camelot }: { keyName: string | null; camelot:
   const color = keyColor(camelot);
   return (
     <span
-      className="num inline-flex h-6 items-center gap-1.5 rounded-full px-2 text-body"
+      title={keyName}
+      className="num inline-flex h-6 max-w-full items-center gap-1.5 rounded-full px-2 text-body"
       style={{ background: keyTint(camelot) ?? undefined }}
     >
-      <span className="h-2 w-2 rounded-full" style={{ background: color ?? "var(--faint)" }} />
-      <span className="font-medium">{keyName}</span>
+      {color && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: color }} />}
+      <span className="truncate font-medium">{keyName}</span>
       {camelot && <span className="text-cap text-muted">{camelot}</span>}
     </span>
   );

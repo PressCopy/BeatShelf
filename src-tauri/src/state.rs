@@ -1,6 +1,5 @@
 use beatcore::db::Db;
 use beatcore::inbox::Source;
-use beatcore::keys::MusicalKey;
 use beatcore::ops::Plan;
 use beatcore::template::LibraryTemplate;
 use serde::{Deserialize, Serialize};
@@ -15,8 +14,7 @@ pub const CONFIG_KEY: &str = "config";
 #[serde(rename_all = "camelCase")]
 pub struct WatchFolder {
     pub path: String,
-    /// Only files changed after this moment are queued, so adding a DAW folder
-    /// with years of old projects does not flood the queue.
+    /// Registration time retained for compatibility with saved configurations.
     pub since: i64,
 }
 
@@ -30,6 +28,8 @@ pub struct Config {
     pub lang: String,
     pub theme: String,
     pub show_backups: bool,
+    pub number_beats: bool,
+    pub number_from: u64,
     /// Your producer name; new beats get it as the author.
     pub producer_name: Option<String>,
 }
@@ -44,6 +44,8 @@ impl Default for Config {
             lang: "ru".into(),
             theme: "dark".into(),
             show_backups: false,
+            number_beats: false,
+            number_from: 1,
             producer_name: None,
         }
     }
@@ -67,16 +69,16 @@ impl Config {
         }
         v
     }
-    pub fn watch_targets(&self) -> Vec<(PathBuf, Source, Option<i64>)> {
+    pub fn watch_targets(&self) -> Vec<(PathBuf, Source)> {
         let mut v = Vec::new();
         if let Some(inbox) = self.inbox_path() {
-            v.push((inbox, Source::Inbox, None));
+            v.push((inbox, Source::Inbox));
         }
         for f in &self.fl_folders {
-            v.push((PathBuf::from(&f.path), Source::Fl, Some(f.since)));
+            v.push((PathBuf::from(&f.path), Source::Fl));
         }
         for f in &self.ableton_folders {
-            v.push((PathBuf::from(&f.path), Source::Ableton, Some(f.since)));
+            v.push((PathBuf::from(&f.path), Source::Ableton));
         }
         v
     }
@@ -86,10 +88,11 @@ impl Config {
 /// A draft (made with "New folder") that receives its first files: the
 /// folder it gets and the fields read from the first file's name.
 pub struct DraftFill {
+    pub original: beatcore::db::BeatRow,
     pub id: i64,
     pub name: String,
     pub bpm: Option<f64>,
-    pub key: Option<MusicalKey>,
+    pub key: Option<String>,
     pub authors: Vec<String>,
 }
 
@@ -97,7 +100,7 @@ pub struct DraftFill {
 pub struct NewBeatMeta {
     pub name: String,
     pub bpm: Option<f64>,
-    pub key: Option<MusicalKey>,
+    pub key: Option<String>,
     pub kind: beatcore::template::ItemKind,
     pub authors: Vec<String>,
     pub coauthors: Vec<String>,
@@ -107,7 +110,7 @@ pub struct NewBeatMeta {
 pub enum AfterExec {
     Nothing,
     Onboarding(Config),
-    SortIntoBeat { folder: String, new_beat: Option<NewBeatMeta>, inbox_ids: Vec<i64>, draft: Option<DraftFill> },
+    SortIntoBeat { folder: String, new_beat: Option<NewBeatMeta>, inbox_ids: Vec<i64>, draft: Option<DraftFill>, number: Option<u64> },
 }
 
 pub struct PendingPlan {
@@ -121,6 +124,7 @@ pub struct AppState {
     pub plans: Mutex<HashMap<String, PendingPlan>>,
     pub watcher: Mutex<Option<crate::watcher::WatchService>>,
     pub scanning: AtomicBool,
+    pub library_io: Mutex<()>,
     /// Files dropped on the window or picked in a dialog, by drop ID. The UI
     /// refers to them by ID, so paths never travel back from the UI.
     pub drops: Mutex<HashMap<String, Vec<PathBuf>>>,

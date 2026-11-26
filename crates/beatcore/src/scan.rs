@@ -5,7 +5,7 @@ use crate::audio;
 use crate::daw::{classify_file, ext_lower, is_ableton_project_dir, is_backup_path, is_junk, AssetKind};
 use crate::db::{AssetUpsert, Db, NewBeat};
 use crate::error::Result;
-use crate::parse::parse_name;
+use crate::parse::parse_folder_name;
 use crate::pathsafe::{from_rel, rel_string};
 use crate::template::{ItemKind, LibraryTemplate};
 use std::collections::HashSet;
@@ -75,13 +75,13 @@ pub fn refresh_beat_folder(db: &Db, root: &Path, rel: &str, kind: ItemKind) -> R
     let beat_id = match existing {
         Some(id) => id,
         None => {
-            let parsed = parse_name(&display_stem(&abs));
+            let parsed = parse_folder_name(&display_stem(&abs));
             stats.beat_added = true;
             db.create_beat(&NewBeat {
                 name: parsed.title,
                 folder: Some(rel.to_string()),
                 bpm: parsed.bpm.map(|v| v as f64),
-                key: parsed.key,
+                key: parsed.key.map(|k| k.name().to_owned()),
                 status: None,
                 kind: Some(kind.as_str().into()),
                 authors: parsed.producers,
@@ -103,7 +103,7 @@ pub fn refresh_beat_folder(db: &Db, root: &Path, rel: &str, kind: ItemKind) -> R
         }
         let Some(asset_rel) = rel_string(root, path) else { continue };
         let Ok(meta) = entry.metadata() else { continue };
-        let backup = is_backup_path(Path::new(&asset_rel));
+        let backup = is_backup_path(path.strip_prefix(&abs).unwrap_or(path));
         if entry.file_type().is_dir() {
             if is_ableton_project_dir(path) {
                 it.skip_current_dir();
@@ -162,6 +162,57 @@ pub fn refresh_beat_folder(db: &Db, root: &Path, rel: &str, kind: ItemKind) -> R
     Ok(stats)
 }
 
+/// A marker inside the user directory lets a fresh index distinguish a new
+/// layout from an old beat with arbitrary subfolders. It contains no user data.
+pub const LAYOUT_MARKER: &str = ".beatshelf-layout-v1";
+
+/// Resolve one template-level directory to the directory that actually owns
+/// the assets. An existing legacy row always retains its original layout.
+pub fn indexed_folder(db: &Db, root: &Path, service: &str) -> Result<String> {
+    if db.beat_id_by_folder(service)?.is_some() {
+        return Ok(service.to_owned());
+    }
+    let known = db.service_user(service)?;
+    if let Some(user) = &known {
+        if from_rel(root, user).is_dir() {
+            return Ok(user.clone());
+        }
+    }
+    let path = from_rel(root, service);
+    if !path.is_dir() {
+        return Ok(known.unwrap_or_else(|| service.to_owned()));
+    }
+    let mut marked = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join(LAYOUT_MARKER).is_dir() {
+            if let Some(user) = rel_string(root, &entry.path()) {
+                marked.push(user);
+            }
+        }
+    }
+    if marked.len() == 1 {
+        let user = marked.pop().unwrap();
+        if let Some(old) = known {
+            // The user renamed the inner directory outside the app.
+            db.apply_moves(root, &[(from_rel(root, &old), from_rel(root, &user))])?;
+        }
+        return Ok(user);
+    }
+    Ok(known.unwrap_or_else(|| service.to_owned()))
+}
+
+pub fn refresh_section_item(db: &Db, root: &Path, service: &str, kind: ItemKind) -> Result<(String, FolderStats)> {
+    let user = indexed_folder(db, root, service)?;
+    let stats = refresh_beat_folder(db, root, &user, kind)?;
+    if user != service {
+        if let Some(id) = db.beat_id_by_folder(&user)? {
+            db.set_service(id, service)?;
+        }
+    }
+    Ok((user, stats))
+}
+
 /// Full scan of every beat folder. `progress` gets the number of folders done.
 pub fn scan_library(db: &Db, root: &Path, tpl: &LibraryTemplate, mut progress: impl FnMut(usize)) -> Result<ScanReport> {
     let mut report = ScanReport::default();
@@ -187,8 +238,10 @@ pub fn scan_library(db: &Db, root: &Path, tpl: &LibraryTemplate, mut progress: i
                 continue;
             }
             if is_junk(entry.path()) || is_backup_path(entry.path()) {
-                it.skip_current_dir();
-                continue;
+                let managed = entry.depth() == depth - prefix.len()
+                    && rel_string(root, entry.path()).is_some_and(|rel|
+                        indexed_folder(db, root, &rel).is_ok_and(|user| user != rel));
+                if !managed { it.skip_current_dir(); continue; }
             }
             if entry.depth() == depth - prefix.len() {
                 if let Some(rel) = rel_string(root, entry.path()) {
@@ -200,13 +253,14 @@ pub fn scan_library(db: &Db, root: &Path, tpl: &LibraryTemplate, mut progress: i
             }
         }
     }
-    let on_disk: HashSet<String> = folders.iter().map(|(f, _)| f.clone()).collect();
+    let mut on_disk = HashSet::new();
 
     db.conn.execute_batch("BEGIN")?;
     let result = (|| -> Result<()> {
         let mut tx_count = 0;
         for (i, (rel, kind)) in folders.iter().enumerate() {
-            let s = refresh_beat_folder(db, root, rel, *kind)?;
+            let (user, s) = refresh_section_item(db, root, rel, *kind)?;
+            on_disk.insert(user);
             report.beat_folders += 1;
             report.beats_added += s.beat_added as usize;
             report.assets_updated += s.updated;
@@ -235,4 +289,50 @@ pub fn scan_library(db: &Db, root: &Path, tpl: &LibraryTemplate, mut progress: i
     db.prune()?;
     progress(folders.len());
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::BeatPatch;
+    use crate::template::default_template;
+    use std::fs;
+
+    #[test]
+    fn old_and_managed_folders_keep_item_and_asset_ids_after_rename_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let db_path = temp.path().join("index.sqlite");
+        let service = "01_Beats/2026/Night_130bpm_Gm";
+        let legacy = "01_Beats/2020/Old_100bpm_Am";
+        let user = format!("{service}/Night — final");
+        fs::create_dir_all(root.join(legacy)).unwrap();
+        fs::create_dir_all(root.join(&user).join(LAYOUT_MARKER)).unwrap();
+        fs::write(root.join(legacy).join("old.txt"), b"legacy").unwrap();
+        fs::write(root.join(&user).join("note.txt"), b"original").unwrap();
+
+        let tpl = default_template();
+        let db = Db::open(&db_path).unwrap();
+        scan_library(&db, &root, &tpl, |_| {}).unwrap();
+        let id = db.beat_id_by_folder(&user).unwrap().unwrap();
+        let old_id = db.beat_id_by_folder(legacy).unwrap().unwrap();
+        let asset = db.asset_state(&format!("{user}/note.txt")).unwrap().unwrap().0;
+        db.update_beat(id, &BeatPatch {
+            key: Some(Some("Ля / минор".into())),
+            ..Default::default()
+        }).unwrap();
+        drop(db);
+
+        let renamed = format!("{service}/Новое имя");
+        fs::rename(root.join(&user), root.join(&renamed)).unwrap();
+        let db = Db::open(&db_path).unwrap();
+        scan_library(&db, &root, &tpl, |_| {}).unwrap();
+        scan_library(&db, &root, &tpl, |_| {}).unwrap();
+        assert_eq!(db.list_beats("").unwrap().len(), 2);
+        assert_eq!(db.beat_id_by_folder(&renamed).unwrap(), Some(id));
+        assert_eq!(db.beat_id_by_folder(legacy).unwrap(), Some(old_id));
+        assert_eq!(db.asset_state(&format!("{renamed}/note.txt")).unwrap().unwrap().0, asset);
+        assert_eq!(db.get_beat(id).unwrap().unwrap().key.as_deref(), Some("Ля / минор"));
+        assert_eq!(fs::read(root.join(&renamed).join("note.txt")).unwrap(), b"original");
+    }
 }

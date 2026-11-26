@@ -7,13 +7,13 @@ import { useStore } from "../store";
 import { useReloadOn } from "../lib/useEvents";
 import { formatBpm, formatDuration, formatSize } from "../lib/format";
 import { dragOut } from "../lib/dragOut";
+import { MetadataField } from "../components/MetadataField";
 import { playNow } from "../components/Player";
 import { Button, DawMark, IconButton, KeyChip, Segmented } from "../components/ui";
 import { KINDS, type AssetKind, type AssetRow, type BeatDetail, type BeatRow, type ItemKind } from "../types";
 
 const ORDER: AssetKind[] = ["fl_project", "fl_zip", "ableton_project", "ableton_set", "audio", "midi", "document", "image", "folder", "other"];
 
-const parent = (p: string) => p.split("/").slice(0, -1).join("/").toLowerCase();
 const splitPeople = (s: string) =>
   s
     .split(",")
@@ -99,11 +99,11 @@ export function BeatDrawer() {
   const projects = assets.filter((a) => a.daw && !a.isBackup);
   const newest = projects.reduce<AssetRow | null>((m, a) => (!m || (a.mtime ?? 0) > (m.mtime ?? 0) ? a : m), null);
   const sorted = [...assets].sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.name.localeCompare(b.name));
-  const wrongSection = !!beat.folder && parent(beat.folder) !== parent(detail.expectedFolder);
+  const wrongSection = detail.wrongSection;
 
   const align = async () => {
     try {
-      const label = wrongSection ? t("detail.moveLabel", { name: beat.name }) : t("detail.alignLabel");
+      const label = t("detail.moveLabel", { name: beat.name });
       showPlan(await api.planAlignFolder(beat.id, label));
     } catch (e) {
       notify(errorText(e), "error");
@@ -215,6 +215,11 @@ export function BeatDrawer() {
               options={KINDS.map((k) => ({ value: k, label: t(`item.${k}`) }))}
             />
           </div>
+          <MetadataField key={beat.id} beat={beat} field="name" />
+          {beat.kind !== "voicetag" && <div className="grid grid-cols-2 gap-3">
+            <MetadataField key={beat.id + "-bpm"} beat={beat} field="bpm" />
+            <MetadataField key={beat.id + "-key"} beat={beat} field="key" />
+          </div>}
           <div className="grid grid-cols-2 gap-3">
             <PeopleField beat={beat} field="authors" label={t("detail.authors")} />
             <PeopleField beat={beat} field="coauthors" label={t("detail.coauthors")} />
@@ -324,21 +329,15 @@ export function BeatDrawer() {
         <section className={beat.folder ? "mb-6" : "hidden"}>
           <h3 className="mb-2 font-semibold">{t("detail.folder")}</h3>
           <div className="flex items-center gap-2">
-            <code className="min-w-0 flex-1 truncate text-muted" title={beat.folder ?? ""}>{beat.folder}</code>
+            <code className="min-w-0 flex-1 truncate text-muted" title={beat.folder ?? ""}>{beat.folder?.split("/").at(-1)}</code>
             <IconButton label={t("common.reveal")} onClick={() => void api.reveal({ type: "beat", id: beat.id })}>
               <FolderOpen size={16} />
             </IconButton>
           </div>
-          {!detail.folderMatchesTemplate && (
+          {wrongSection && (
             <div className="mt-2 rounded-md bg-warn-bg px-3 py-2">
-              <p>
-                {wrongSection
-                  ? t("detail.wrongSection", { path: detail.expectedFolder })
-                  : t("detail.folderMismatch", { name: detail.expectedFolderName })}
-              </p>
-              <Button className="mt-2" onClick={() => void align()}>
-                {wrongSection ? t("detail.moveFolder") : t("detail.alignFolder")}
-              </Button>
+              <p>{t("detail.wrongSection", { path: detail.expectedFolder })}</p>
+              <Button className="mt-2" onClick={() => void align()}>{t("detail.moveFolder")}</Button>
             </div>
           )}
         </section>

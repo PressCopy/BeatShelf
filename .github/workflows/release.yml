@@ -2,31 +2,65 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths: ["src-tauri/tauri.conf.json"]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(jq -er '.version' src-tauri/tauri.conf.json)
+          test "$version" = "$(jq -er '.version' package.json)"
+          tag="v$version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then test "$GITHUB_REF_NAME" = "$tag"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: version
+    if: needs.version.outputs.build == 'true'
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macOS (Apple Silicon + Intel)
+          - name: macOS universal
             runner: macos-latest
             targets: aarch64-apple-darwin,x86_64-apple-darwin
-            args: --target universal-apple-darwin
+            args: --target universal-apple-darwin --bundles dmg
+            artifact: macos
           - name: Windows x64
             runner: windows-latest
-            targets: ""
-            args: ""
+            targets: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles nsis,msi
+            artifact: win-x64
           - name: Windows ARM64
             runner: windows-latest
             targets: aarch64-pc-windows-msvc
             args: --target aarch64-pc-windows-msvc --bundles nsis
+            artifact: win-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -39,16 +73,48 @@ jobs:
           targets: ${{ matrix.targets }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}
+          key: release-${{ matrix.artifact }}
       - run: npm ci
       - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: Beatshelf v__VERSION__
-          releaseBody: |
-            Сборки без подписи. Как установить на Windows и macOS — в README, раздел «Установка».
-          releaseDraft: true
-          prerelease: true
           args: ${{ matrix.args }}
+      - name: Archive the macOS app
+        if: runner.os == 'macOS'
+        run: |
+          cd target/universal-apple-darwin/release/bundle/macos
+          tar -czf Beatshelf_universal.app.tar.gz Beatshelf.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            target/*/release/bundle/nsis/*-setup.exe
+            target/*/release/bundle/msi/*.msi
+            target/*/release/bundle/dmg/*.dmg
+            target/*/release/bundle/macos/*.app.tar.gz
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+      - name: Verify installers and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          files=()
+          for name in "Beatshelf_${version}_x64-setup.exe" "Beatshelf_${version}_x64_en-US.msi" "Beatshelf_${version}_arm64-setup.exe" "Beatshelf_${version}_universal.dmg" "Beatshelf_universal.app.tar.gz"; do
+            mapfile -t matches < <(find packages -type f -name "$name")
+            test "${#matches[@]}" -eq 1
+            test -s "${matches[0]}"
+            files+=("${matches[0]}")
+          done
+          gh release create "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "BeatShelf $TAG" --notes 'Windows x64 — EXE или MSI. Windows ARM64 — ARM64 EXE. macOS на Apple Silicon и Intel — универсальный DMG. Установщики без сертификата подписи издателя.'

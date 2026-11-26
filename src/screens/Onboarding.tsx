@@ -140,12 +140,7 @@ export function Onboarding() {
                     className={`rounded-lg border px-4 py-3 text-left transition-colors ${on ? "border-text bg-raised" : "border-line hover:border-muted"}`}
                   >
                     <div className="mb-2 text-sub font-semibold">{tpl.name}</div>
-                    <dl className="grid grid-cols-[120px_1fr] gap-y-1 text-body">
-                      <dt className="text-muted">{t("onboarding.beatFolder")}</dt>
-                      <dd><code>{tpl.beatDir}</code></dd>
-                      <dt className="text-muted">{t("onboarding.fileName")}</dt>
-                      <dd><code>{tpl.fileName}</code></dd>
-                    </dl>
+                    <div className="text-muted">{[tpl.inbox, tpl.staticDirs[0]?.split("/")[0], tpl.archive].filter(Boolean).join(" · ")}</div>
                   </button>
                 );
               })}

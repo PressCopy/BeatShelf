@@ -168,7 +168,7 @@ pub struct LibraryTemplate {
 pub struct TokenValues {
     pub name: String,
     pub bpm: Option<f32>,
-    pub key: Option<MusicalKey>,
+    pub key: Option<String>,
     pub date: Option<NaiveDate>,
     pub artist: Option<String>,
     pub authors: Vec<String>,
@@ -285,8 +285,8 @@ fn token_value(token: &str, v: &TokenValues) -> Option<String> {
     match token {
         "name" => Some(v.name.trim().to_string()).filter(|s| !s.is_empty()),
         "bpm" => v.bpm.map(format_bpm),
-        "key" => v.key.map(|k| k.name().to_string()),
-        "camelot" => v.key.map(|k| k.camelot_code()),
+        "key" => v.key.clone(),
+        "camelot" => v.key.as_deref().and_then(MusicalKey::parse).map(|k| k.camelot_code()),
         "date" => Some(date.format("%Y-%m-%d").to_string()),
         "year" => Some(date.year().to_string()),
         "artist" => v.artist.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
@@ -575,7 +575,8 @@ impl LibraryTemplate {
             .into_iter()
             .map(|p| (p.split('/').map(|s| s.to_string()).collect(), "dir"))
             .collect();
-        let beat = self.beat_dir_for(example);
+        let mut beat = self.beat_dir_for(example);
+        beat.push(example.name.clone());
         for i in self.beat_static_prefix().len()..beat.len() {
             let role = if i + 1 == beat.len() { "beat" } else { "example" };
             paths.push((beat[..=i].to_vec(), role));
@@ -602,7 +603,7 @@ mod tests {
         TokenValues {
             name: name.into(),
             bpm,
-            key: key.and_then(MusicalKey::parse),
+            key: key.map(str::to_owned),
             date: NaiveDate::from_ymd_opt(2026, 11, 13),
             ..Default::default()
         }
@@ -687,8 +688,9 @@ mod tests {
         assert!(dirs.iter().position(|d| d == "02_Samples_Kits").unwrap()
             < dirs.iter().position(|d| d == "02_Samples_Kits/Drums").unwrap());
         let preview = t.preview("Beats", &vals("Night", Some(140.0), Some("Am")));
-        assert!(preview.iter().any(|l| l.name == "Night_140bpm_Am" && l.role == "beat"));
-        assert!(preview.iter().any(|l| l.name == "Project_Ableton" && l.depth == 4));
+        assert!(preview.iter().any(|l| l.name == "Night" && l.role == "beat"));
+        assert!(preview.iter().any(|l| l.name == "Night_140bpm_Am" && l.role == "example"));
+        assert!(preview.iter().any(|l| l.name == "Project_Ableton" && l.depth == 5));
     }
 
     #[test]

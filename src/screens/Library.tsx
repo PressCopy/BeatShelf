@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowUpDown, FolderOpen, PanelRight, Pause, Play, Search, Star, Trash } from "lucide-react";
+import { ArrowUpDown, ChevronDown, FolderOpen, PanelRight, Pause, Play, Search, Star, Trash } from "lucide-react";
 import { api, errorText, fileUrl } from "../api";
 import { useStore, type PlayTarget } from "../store";
 import { useDebounced, useReloadOn } from "../lib/useEvents";
@@ -11,9 +11,11 @@ import { dragOut } from "../lib/dragOut";
 import { playNow, seekTo, togglePlay } from "../components/Player";
 import { MiniWave } from "../components/MiniWave";
 import { AddButtons } from "../components/AddButtons";
+import { MetadataField, toPatch, type TextField, type MainField } from "../components/MetadataField";
+import { Dialog } from "../components/ui";
 import { ContextMenu } from "../components/ContextMenu";
 import { DawMark, Empty, KeyChip, KIND_ICON } from "../components/ui";
-import { STATUSES, type BeatPatch, type BeatRow, type BeatStatus } from "../types";
+import { STATUSES, type BeatRow, type BeatStatus } from "../types";
 
 const ROW_H = 60;
 const HEADER_H = 32;
@@ -23,26 +25,8 @@ const GRID =
   "grid grid-cols-[40px_minmax(220px,2.4fr)_minmax(150px,1.5fr)_48px_108px_56px_140px_88px_52px] items-center gap-x-4 px-6";
 const COLUMNS = ["", "name", "", "length", "key", "bpm", "status", "rating", "daw"] as const;
 
-type TextField = "name" | "bpm" | "key" | "genre" | "mood" | "typeBeat";
-type Sort = "recent" | "name" | "bpm";
 
-function toPatch(field: TextField, raw: string): BeatPatch | { error: "bpm" } {
-  const v = raw.trim();
-  switch (field) {
-    case "name":
-      return v ? { name: v } : {};
-    case "bpm": {
-      if (!v) return { bpm: null };
-      const n = Number(v.replace(",", "."));
-      if (!Number.isFinite(n) || n < 40 || n > 300) return { error: "bpm" };
-      return { bpm: n };
-    }
-    case "key":
-      return { key: v || null };
-    default:
-      return { [field]: v || null } as BeatPatch;
-  }
-}
+type Sort = "recent" | "name" | "bpm";
 
 function playTarget(b: BeatRow): PlayTarget {
   return { type: "asset", id: b.previewAssetId!, title: b.name, bpm: b.bpm, key: b.key, camelot: b.camelot, color: b.color, beatId: b.id };
@@ -74,13 +58,15 @@ function EditableCell({
   const initial = field === "bpm" ? formatBpm(beat.bpm) : ((beat[field] as string | null) ?? "");
   const [value, setValue] = useState(initial);
   const done = useRef(false);
+  const editTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(editTimer.current), [armed, beat.id]);
   const label = t(`library.col.${field}`);
 
   const commit = async () => {
     if (done.current) return;
     done.current = true;
     setEditing(false);
-    if (value.trim() === initial.trim()) return;
+    if (value === initial) return;
     const patch = toPatch(field, value);
     if ("error" in patch) {
       notify(t("library.badBpm"), "error");
@@ -89,8 +75,7 @@ function EditableCell({
     try {
       onSaved(await api.updateBeat(beat.id, patch));
     } catch (e) {
-      const msg = errorText(e);
-      notify(msg.startsWith("bad_key:") ? t("library.badKey", { value: msg.slice(8) }) : msg, "error");
+      notify(errorText(e), "error");
     }
   };
 
@@ -131,12 +116,19 @@ function EditableCell({
       type="button"
       tabIndex={armed ? 0 : -1}
       onClick={(e) => {
-        if (!armed) return; // first click selects the row
+        clearTimeout(editTimer.current);
+        if (!armed || e.detail > 1) return;
         e.stopPropagation();
-        done.current = false;
-        setValue(initial);
-        setEditing(true);
+        const edit = () => {
+          done.current = false;
+          setValue(initial);
+          setEditing(true);
+        };
+        // Leave the button mounted until a pointer double-click can reach the row.
+        if (e.detail === 0) edit();
+        else editTimer.current = setTimeout(edit, 500);
       }}
+      onDoubleClick={() => clearTimeout(editTimer.current)}
       title={label}
       className={
         chip
@@ -191,6 +183,7 @@ export function Library() {
   const debounced = useDebounced(query, 150);
   const reload = useReloadOn(["library-changed", "beat-updated"]);
   const [menu, setMenu] = useState<{ x: number; y: number; beat: BeatRow } | null>(null);
+  const [editor, setEditor] = useState<{ beat: BeatRow; field: MainField } | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
   const showPlan = useStore((s) => s.showPlan);
   const notify = useStore((s) => s.notify);
@@ -347,31 +340,35 @@ export function Library() {
               className="h-10 w-full rounded-full border border-line bg-surface pl-11 pr-4 outline-none placeholder:text-faint focus:border-muted"
             />
           </label>
-          <select
-            value={status}
-            onChange={(e) => setStatus(e.target.value as BeatStatus | "")}
-            aria-label={t("library.col.status")}
-            className={`h-10 rounded-full border bg-surface px-4 outline-none focus:border-muted ${
-              status ? "border-muted text-text" : "border-line text-muted"
-            }`}
-          >
-            <option value="">{t("library.allStatuses")}</option>
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>{t(`status.${s}`)}</option>
-            ))}
-          </select>
-          <label className="relative">
-            <ArrowUpDown size={14} className="pointer-events-none absolute left-4 top-[13px] text-faint" />
+          <label className="relative inline-flex">
+            <select
+              value={status}
+              onChange={(e) => setStatus(e.target.value as BeatStatus | "")}
+              aria-label={t("library.col.status")}
+              className={`h-10 appearance-none rounded-full border bg-surface pl-4 pr-8 outline-none focus:border-muted ${
+                status ? "border-muted text-text" : "border-line text-muted"
+              }`}
+            >
+              <option value="">{t("library.allStatuses")}</option>
+              {STATUSES.map((s) => (
+                <option key={s} value={s}>{t(`status.${s}`)}</option>
+              ))}
+            </select>
+            <ChevronDown size={14} aria-hidden="true" className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted" />
+          </label>
+          <label className="relative inline-flex">
+            <ArrowUpDown size={14} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-faint" />
             <select
               value={sort}
               onChange={(e) => setSort(e.target.value as Sort)}
               aria-label={t("library.sort.label")}
-              className="h-10 rounded-full border border-line bg-surface pl-10 pr-4 text-muted outline-none focus:border-muted"
+              className="h-10 appearance-none rounded-full border border-line bg-surface pl-10 pr-8 text-muted outline-none focus:border-muted"
             >
               <option value="recent">{t("library.sort.recent")}</option>
               <option value="name">{t("library.sort.name")}</option>
               <option value="bpm">{t("library.sort.bpm")}</option>
             </select>
+            <ChevronDown size={14} aria-hidden="true" className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted" />
           </label>
         </div>
       </header>
@@ -425,8 +422,7 @@ export function Library() {
                     }}
                     onDoubleClick={() => {
                       select(b);
-                      if (hasAudio) playNow(playTarget(b));
-                      else openDetail(b.id);
+                      openDetail(b.id);
                     }}
                     className={`${GRID} group absolute left-0 right-0 border-b border-line/40 ${
                       dropBeatId === b.id
@@ -597,12 +593,20 @@ export function Library() {
           onClose={closeMenu}
           items={[
             { label: t("menu.open"), icon: <PanelRight size={15} />, onSelect: () => openDetail(menu.beat.id) },
+            ...(menu.beat.kind === "voicetag" ? ["name"] as const : ["name", "bpm", "key"] as const).map((field) => ({
+              label: t(`menu.edit.${field}`), onSelect: () => setEditor({ beat: menu.beat, field }),
+            })),
             ...(menu.beat.folder
               ? [{ label: t("common.reveal"), icon: <FolderOpen size={15} />, onSelect: () => void api.reveal({ type: "beat", id: menu.beat.id }) }]
               : []),
             { label: t("menu.delete"), icon: <Trash size={15} />, danger: true, onSelect: () => void remove(menu.beat) },
           ]}
         />
+      )}
+      {editor && (
+        <Dialog title={t(`menu.edit.${editor.field}`)} width={380} onClose={() => setEditor(null)}>
+          <MetadataField beat={rows?.find((r) => r.id === editor.beat.id) ?? editor.beat} field={editor.field} onClose={() => setEditor(null)} />
+        </Dialog>
       )}
     </div>
   );

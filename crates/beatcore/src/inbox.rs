@@ -9,7 +9,7 @@ use crate::daw::{
     AssetKind,
 };
 use crate::db::InboxUpsert;
-use crate::parse::parse_name;
+use crate::parse::{parse_folder_name, parse_name};
 use crate::pathsafe::is_within;
 use crate::scan::{display_stem, mtime_secs};
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,26 @@ fn daw_relevant(p: &Path) -> bool {
     matches!(ext_lower(p).as_str(), "flp" | "zip" | "als" | "mid" | "midi") || is_audio(p)
 }
 
+fn technical_dir(p: &Path) -> bool {
+    let name = p.file_name().unwrap_or_default().to_string_lossy();
+    ["Ableton Project Info", "Backup", "Backups", "Auto-Backups", "Project bones"].iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// Folder supplying the original project name. For an export in a subfolder,
+/// prefer the closest enclosing FL project within the selected watch root.
+pub fn project_name_at(path: &Path, root: &Path) -> String {
+    let parent = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    let dir = if path.is_dir() { path } else {
+        parent.ancestors().take_while(|p| p.starts_with(root)).find(|p| {
+            std::fs::read_dir(p).ok().is_some_and(|entries| entries.flatten().any(|e| {
+                matches!(ext_lower(&e.path()).as_str(), "flp" | "als") && !is_backup_path(&e.path())
+            }))
+        }).unwrap_or(parent)
+    };
+    dir.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
 /// Which queue item does a file-system event at `path` belong to?
 pub fn candidate_for(path: &Path, watch_root: &Path, source: Source) -> Option<PathBuf> {
     if !is_within(path, watch_root) || path == watch_root {
@@ -132,7 +152,8 @@ pub fn candidate_for(path: &Path, watch_root: &Path, source: Source) -> Option<P
             }
         }
         Source::Fl | Source::Ableton => {
-            if is_backup_path(path) || is_junk(path) {
+            if is_backup_path(path) || path.ancestors().take_while(|p| *p != watch_root)
+                .any(|p| is_junk(p) || technical_dir(p) || p.is_symlink()) {
                 return None;
             }
             if let Some(proj) = ableton_project_root(path) {
@@ -163,11 +184,14 @@ pub fn scan_candidates(watch_root: &Path, source: Source) -> Vec<PathBuf> {
             }
         }
         Source::Fl | Source::Ableton => {
+            if is_ableton_project_dir(watch_root) {
+                return vec![watch_root.to_path_buf()];
+            }
             let mut it = walkdir::WalkDir::new(watch_root).min_depth(1).follow_links(false).into_iter();
             while let Some(entry) = it.next() {
                 let Ok(entry) = entry else { continue };
                 let p = entry.path();
-                if is_junk(p) || is_backup_path(p) {
+                if entry.file_type().is_symlink() || is_junk(p) || is_backup_path(p) || technical_dir(p) {
                     if entry.file_type().is_dir() {
                         it.skip_current_dir();
                     }
@@ -189,7 +213,7 @@ pub fn scan_candidates(watch_root: &Path, source: Source) -> Vec<PathBuf> {
 
 /// Build the queue record for a stable candidate. DAW folders only feed
 /// project and audio files; the Inbox accepts anything.
-pub fn describe(path: &Path, source: Source) -> Option<InboxUpsert> {
+pub fn describe(path: &Path, source: Source, root: &Path) -> Option<InboxUpsert> {
     let meta = std::fs::metadata(path).ok()?;
     let (kind, is_dir) = if meta.is_dir() {
         if is_ableton_project_dir(path) {
@@ -214,7 +238,16 @@ pub fn describe(path: &Path, source: Source) -> Option<InboxUpsert> {
         return None;
     }
     let (size, newest) = measure(path)?;
-    let parsed = parse_name(&display_stem(path));
+    let folder_name = if source == Source::Inbox {
+        if is_dir { path.file_name().map(|n| n.to_string_lossy().into_owned()) } else { None }
+    } else {
+        Some(project_name_at(path, root))
+    };
+    let input = folder_name.clone().unwrap_or_else(|| display_stem(path));
+    let title_source = if kind == AssetKind::AbletonProject {
+        input.strip_suffix(" Project").unwrap_or(&input)
+    } else { &input };
+    let parsed = if folder_name.is_some() { parse_folder_name(title_source) } else { parse_name(title_source) };
     let mtime = newest
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
@@ -227,6 +260,7 @@ pub fn describe(path: &Path, source: Source) -> Option<InboxUpsert> {
         is_dir,
         size: Some(size as i64),
         mtime,
+        folder_name,
         title: Some(parsed.title),
         bpm: parsed.bpm.map(|v| v as f64),
         key: parsed.key.map(|k| k.name().to_string()),
@@ -286,7 +320,7 @@ mod tests {
         );
         let found = scan_candidates(&live, Source::Ableton);
         assert_eq!(found, vec![proj.clone()]);
-        let d = describe(&proj, Source::Ableton).unwrap();
+        let d = describe(&proj, Source::Ableton, &live).unwrap();
         assert_eq!(d.kind, "ableton_project");
         assert_eq!(d.title.as_deref(), Some("Night"));
     }

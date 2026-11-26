@@ -53,14 +53,15 @@ export function AddFilesDialog() {
   useEffect(() => {
     if (!req) return;
     const st = useStore.getState();
-    const s = req.suggest;
+    const s = req.suggest ?? req.drop.folderSuggestion;
     setError(null);
     setQuery("");
     setSlots(Object.fromEntries(req.drop.items.map((i) => [String(i.index), i.slot])));
     setMode(req.mode ?? (req.beatId != null ? "beat" : "new"));
     setKind(req.kind ?? (st.libraryKind === "all" ? "beat" : st.libraryKind));
     // Without a suggestion (files dropped on the window) start from the first file's name.
-    setName(s?.name ?? (req.drop.items[0]?.name ?? "").replace(/\.[^.]+$/, ""));
+    const first = req.drop.items[0];
+    setName(s?.name ?? (first?.isDir ? first.name : (first?.name ?? "").replace(/\.[^.]+$/, "")));
     setBpm(formatBpm(s?.bpm ?? null));
     setKey(s?.key ?? "");
     setAuthors(s?.authors.length ? s.authors.join(", ") : (st.app?.config.producerName ?? ""));
@@ -86,6 +87,7 @@ export function AddFilesDialog() {
 
   const submit = async () => {
     setError(null);
+    const suggestion = req.suggest ?? req.drop.folderSuggestion;
     let target: AddTarget;
     let label: string;
     if (mode === "new") {
@@ -96,7 +98,7 @@ export function AddFilesDialog() {
         type: "new",
         name: name.trim(),
         bpm: n,
-        key: tag ? null : key.trim() || null,
+        key: tag ? null : key || null,
         kind,
         authors: tag ? [] : people(authors),
         coauthors: tag ? [] : people(coauthors),
@@ -117,6 +119,7 @@ export function AddFilesDialog() {
     try {
       const plan = await api.planAddFiles({
         dropId: req.drop.dropId,
+        userFolder: mode === "new" && name !== suggestion?.name ? name : suggestion?.userFolder,
         target,
         slots: mode === "inbox" || flat ? {} : slots,
         label,

@@ -4,11 +4,10 @@
 use crate::state::{AfterExec, AppState, Config, DraftFill, NewBeatMeta, PendingPlan, WatchFolder};
 use beatcore::daw::AssetKind;
 use beatcore::db::{AssetRow, BatchRow, BeatPatch, BeatRow, InboxItem, NewBeat};
-use beatcore::keys::MusicalKey;
 use beatcore::ops::{self, ExecError, ExecOptions, Issue, Plan, PlanBuilder, Step};
-use beatcore::parse::parse_name;
-use beatcore::pathsafe::{fold_key, from_rel, is_within, rel_string, sanitize_component, unique_name};
-use beatcore::scan::{refresh_beat_folder, scan_library};
+use beatcore::parse::{parse_folder_name, parse_name};
+use beatcore::pathsafe::{fold_key, from_rel, is_within, rel_string, unique_name};
+use beatcore::scan::{refresh_section_item, scan_library, LAYOUT_MARKER};
 use beatcore::template::{builtin_templates, ItemKind, LibraryTemplate, SubdirSlot, TokenValues, TreeLine};
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -76,8 +75,7 @@ pub struct MediaDto {
 pub struct BeatDetail {
     pub beat: BeatRow,
     pub assets: Vec<AssetRow>,
-    pub folder_matches_template: bool,
-    pub expected_folder_name: String,
+    pub wrong_section: bool,
     /// Full relative path the template expects (kind decides the section).
     pub expected_folder: String,
 }
@@ -115,7 +113,7 @@ pub enum SortTarget {
 pub struct SortRequest {
     pub inbox_ids: Vec<i64>,
     pub target: SortTarget,
-    pub rename: bool,
+
     #[serde(default)]
     pub slots: HashMap<String, SubdirSlot>,
     pub label: String,
@@ -127,6 +125,8 @@ pub struct PrefsPatch {
     pub lang: Option<String>,
     pub theme: Option<String>,
     pub show_backups: Option<bool>,
+    pub number_beats: Option<bool>,
+    pub number_from: Option<u64>,
     #[serde(default, deserialize_with = "some_option")]
     pub producer_name: Option<Option<String>>,
 }
@@ -181,7 +181,7 @@ fn view_plan(plan: &Plan, cfg: &Config) -> PlanView {
             .steps
             .iter()
             .map(|s| match s {
-                Step::CreateDir { path } => StepView { kind: "create_dir", from: None, to: shorten(path, &bases) },
+                Step::CreateDir { path } | Step::CreateNewDir { path } => StepView { kind: "create_dir", from: None, to: shorten(path, &bases) },
                 Step::Move { from, to } => {
                     let same_parent = from.parent() == to.parent();
                     StepView {
@@ -234,7 +234,7 @@ pub fn restart_watcher(app: &AppHandle, state: &AppState, cfg: &Config) {
     let targets = cfg
         .watch_targets()
         .into_iter()
-        .map(|(root, source, since)| crate::watcher::Target { root, source, since })
+        .map(|(root, source)| crate::watcher::Target { root, source })
         .collect();
     match crate::watcher::start(app.clone(), state.db_path.clone(), root, targets) {
         Ok(w) => *guard = Some(w),
@@ -254,6 +254,8 @@ pub fn spawn_scan(app: &AppHandle, state: &AppState) {
     let db_path = state.db_path.clone();
     let app = app.clone();
     std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let _io = state.library_io.lock().unwrap();
         let result = beatcore::db::Db::open(&db_path).and_then(|db| {
             scan_library(&db, &root, &tpl, |done| {
                 let _ = app.emit("scan-progress", done);
@@ -309,7 +311,7 @@ fn values_for(beat: &BeatRow) -> TokenValues {
     TokenValues {
         name: beat.name.clone(),
         bpm: beat.bpm.map(|v| v as f32),
-        key: beat.key.as_deref().and_then(MusicalKey::parse),
+        key: beat.key.clone(),
         date: chrono::Local.timestamp_opt(beat.created_at, 0).single().map(|d| d.date_naive()),
         artist: None,
         authors: beat.authors.clone(),
@@ -321,6 +323,50 @@ fn kind_of(beat: &BeatRow) -> ItemKind {
     ItemKind::parse(&beat.kind).unwrap_or(ItemKind::Beat)
 }
 
+const COUNTER: &str = "next_beat_number";
+const MAX_NUMBER: u64 = 9_007_199_254_740_991;
+
+fn planned_number(db: &beatcore::db::Db, cfg: &Config, kind: ItemKind) -> CmdResult<Option<u64>> {
+    if !cfg.number_beats || kind != ItemKind::Beat {
+        return Ok(None);
+    }
+    let next = db.get_setting::<u64>(COUNTER).map_err(err)?.unwrap_or(cfg.number_from);
+    if next > MAX_NUMBER { return Err("number_limit".into()); }
+    Ok(Some(next))
+}
+
+/// Template output is an internal directory. Only one ordinary path component
+/// supplied by the user may be appended to it.
+fn new_folder(tpl: &LibraryTemplate, root: &Path, kind: ItemKind, values: &TokenValues,
+              user: &str, number: Option<u64>) -> CmdResult<String> {
+    if Path::new(user).file_name().and_then(|v| v.to_str()) != Some(user)
+        || user.contains('\0') || user.is_empty() {
+        return Err("bad_folder_name".into());
+    }
+    #[cfg(windows)]
+    if user.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        || user.ends_with(['.', ' ']) || beatcore::pathsafe::is_reserved_name(user) {
+        return Err("bad_folder_name".into());
+    }
+    let mut parts = tpl.dir_for(kind, values);
+    let leaf = parts.pop().ok_or("bad_pattern")?;
+    let parent = from_rel(root, &parts.join("/"));
+    parts.push(unique_name(&parent, &leaf, &HashSet::new()));
+    let user = match number {
+        Some(n) if !user.starts_with(&format!("{n} ")) => format!("{n} {user}"),
+        _ => user.to_owned(),
+    };
+    parts.push(user);
+    Ok(parts.join("/"))
+}
+
+fn plan_layout(b: &mut PlanBuilder, user: &Path) {
+    // Claim the parent before copying or moving any files. A second plan
+    // with the same name must never adopt someone else's directory.
+    b.create_new_dir(user.parent().expect("a user directory has a service parent"));
+    b.create_dir(user.join(LAYOUT_MARKER));
+}
+
 /// Where files for an existing item go. A draft (made with "New folder") has
 /// no folder yet: it gets one now, named after the first file added, unless
 /// someone already typed a name for it.
@@ -329,7 +375,8 @@ fn existing_target(
     root: &Path,
     db: &beatcore::db::Db,
     beat: &BeatRow,
-    first: Option<&Path>,
+    source_name: Option<&str>,
+    number: Option<u64>,
 ) -> CmdResult<(String, TokenValues, ItemKind, Option<DraftFill>)> {
     let kind = kind_of(beat);
     if let Some(folder) = &beat.folder {
@@ -339,19 +386,9 @@ fn existing_target(
     if !is_draft {
         return Err("this beat has no folder".into());
     }
-    // The first file's name without its extension ("Night_140bpm_Am.wav" → "Night_140bpm_Am").
-    let stem = first
-        .map(|p| {
-            let n = if p.is_dir() { p.file_name() } else { p.file_stem() };
-            let n = n.map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if beatcore::daw::is_ableton_project_dir(p) {
-                n.strip_suffix(" Project").unwrap_or(&n).to_string()
-            } else {
-                n
-            }
-        })
-        .unwrap_or_default();
-    let parsed = parse_name(&stem);
+    let stem = source_name.unwrap_or_default().to_owned();
+    let user = if auto_name && !stem.is_empty() { &stem } else { &beat.name };
+    let parsed = parse_folder_name(user);
     let tag = kind == ItemKind::Voicetag;
     let mut name = beat.name.clone();
     if auto_name {
@@ -361,8 +398,14 @@ fn existing_target(
             name = from_file.trim().to_string();
         }
     }
-    let bpm = if tag { None } else { beat.bpm.or(parsed.bpm.map(|b| b as f64)) };
-    let key = if tag { None } else { beat.key.as_deref().and_then(MusicalKey::parse).or(parsed.key) };
+    let (bpm_edited, key_edited) = db.draft_edits(beat.id).map_err(err)?;
+    let first = parse_name(&stem);
+    let bpm = if tag || bpm_edited { beat.bpm } else {
+        beat.bpm.or(parsed.bpm.or(first.bpm).map(f64::from))
+    };
+    let key = if tag || key_edited { beat.key.clone() } else {
+        beat.key.clone().or_else(|| parsed.key.or(first.key).map(|k| k.name().to_owned()))
+    };
     let mut authors = beat.authors.clone();
     if authors.is_empty() && !tag {
         authors = parsed.producers.clone();
@@ -370,15 +413,10 @@ fn existing_target(
     let mut values = values_for(beat);
     values.name = name.clone();
     values.bpm = bpm.map(|v| v as f32);
-    values.key = key;
+    values.key = key.clone();
     values.authors = authors.clone();
-    let mut parts = tpl.dir_for(kind, &values);
-    // A new item never merges into a folder that is already there.
-    if let Some(leaf) = parts.pop() {
-        let parent = from_rel(root, &parts.join("/"));
-        parts.push(unique_name(&parent, &leaf, &HashSet::new()));
-    }
-    Ok((parts.join("/"), values, kind, Some(DraftFill { id: beat.id, name, bpm, key, authors })))
+    let folder = new_folder(tpl, root, kind, &values, user, number)?;
+    Ok((folder, values, kind, Some(DraftFill { original: beat.clone(), id: beat.id, name, bpm, key, authors })))
 }
 
 /// Folder, template values and row data for an item that doesn't exist yet.
@@ -392,14 +430,25 @@ fn new_item(
     kind: Option<&str>,
     authors: &[String],
     coauthors: &[String],
+    user: &str,
+    number: Option<u64>,
 ) -> CmdResult<(String, TokenValues, NewBeatMeta)> {
     let name = name.trim();
     if name.is_empty() {
         return Err("name is empty".into());
     }
-    let key = key.and_then(MusicalKey::parse);
+    let key = key.filter(|v| !v.is_empty()).map(str::to_owned);
     let kind = kind.and_then(ItemKind::parse).unwrap_or(ItemKind::Beat);
+    // A newly typed folder also supplies suggestions. A picked folder already
+    // went through the editable suggestion form, including any cleared fields.
+    let parsed = (name == user && kind != ItemKind::Voicetag).then(|| parse_folder_name(user));
+    let name = parsed.as_ref().map(|p| p.title.as_str()).filter(|s| !s.is_empty()).unwrap_or(name);
+    let bpm = bpm.or_else(|| parsed.as_ref().and_then(|p| p.bpm).map(f64::from));
+    let key = key.or_else(|| parsed.as_ref().and_then(|p| p.key).map(|k| k.name().to_owned()));
     let mut authors = people(authors);
+    if authors.is_empty() {
+        if let Some(parsed) = &parsed { authors.clone_from(&parsed.producers); }
+    }
     if authors.is_empty() && kind != ItemKind::Voicetag {
         authors.extend(cfg.producer_name.clone().filter(|n| !n.trim().is_empty()));
     }
@@ -407,58 +456,53 @@ fn new_item(
     let values = TokenValues {
         name: name.into(),
         bpm: bpm.map(|v| v as f32),
-        key,
+        key: key.clone(),
         date: None,
         artist: None,
         authors: authors.clone(),
         coauthors: coauthors.clone(),
     };
-    let folder = tpl.dir_for(kind, &values).join("/");
+    let folder = new_folder(tpl, &cfg.root_path().ok_or("no library")?, kind, &values, user, number)?;
     Ok((folder, values, NewBeatMeta { name: name.into(), bpm, key, kind, authors, coauthors }))
 }
 
 /// Database follow-up after files moved: paths, beat rows, inbox rows.
-fn after_execution(state: &AppState, cfg: &Config, report: &ops::ExecReport, after: &AfterExec) -> CmdResult<()> {
+fn after_execution(db: &beatcore::db::Db, cfg: &Config, report: &ops::ExecReport, after: &AfterExec) -> CmdResult<()> {
     let Ok((root, tpl)) = library(cfg) else { return Ok(()) };
-    let db = state.db.lock().unwrap();
+    let tx = db.conn.unchecked_transaction().map_err(err)?;
     db.apply_moves(&root, &report.movements()).map_err(err)?;
 
-    if let AfterExec::SortIntoBeat { folder, new_beat, inbox_ids, draft } = after {
+    if let AfterExec::SortIntoBeat { folder, new_beat, inbox_ids, draft, number } = after {
         if let Some(d) = draft {
             // Before the folder is re-read below, or it would be taken for a new item.
             db.adopt_draft(d.id, folder).map_err(err)?;
             let patch = BeatPatch {
                 name: Some(d.name.clone()),
                 bpm: Some(d.bpm),
-                key: Some(d.key.map(|k| k.name().to_string())),
+                key: Some(d.key.clone()),
                 authors: Some(d.authors.clone()),
                 ..Default::default()
             };
             db.update_beat(d.id, &patch).map_err(err)?;
         }
         if let Some(meta) = new_beat {
-            match db.beat_id_by_folder(folder).map_err(err)? {
-                Some(id) => {
-                    let patch = BeatPatch {
-                        bpm: meta.bpm.map(Some),
-                        key: meta.key.map(|k| Some(k.name().to_string())),
-                        ..Default::default()
-                    };
-                    db.update_beat(id, &patch).map_err(err)?;
-                }
-                None => {
-                    db.create_beat(&NewBeat {
-                        name: meta.name.clone(),
-                        folder: Some(folder.clone()),
-                        bpm: meta.bpm,
-                        key: meta.key,
-                        status: Some(if meta.kind == ItemKind::Voicetag { "ready" } else { "in_progress" }.into()),
-                        kind: Some(meta.kind.as_str().into()),
-                        authors: meta.authors.clone(),
-                        coauthors: meta.coauthors.clone(),
-                    })
-                    .map_err(err)?;
-                }
+            db.create_beat(&NewBeat {
+                name: meta.name.clone(),
+                folder: Some(folder.clone()),
+                bpm: meta.bpm,
+                key: meta.key.clone(),
+                status: Some(if meta.kind == ItemKind::Voicetag { "ready" } else { "in_progress" }.into()),
+                kind: Some(meta.kind.as_str().into()),
+                authors: meta.authors.clone(),
+                coauthors: meta.coauthors.clone(),
+            }).map_err(err)?;
+        }
+        if new_beat.is_some() || draft.is_some() {
+            let id = db.beat_id_by_folder(folder).map_err(err)?.ok_or("missing item")?;
+            let (service, _) = folder.rsplit_once('/').ok_or("missing service folder")?;
+            db.set_service(id, service).map_err(err)?;
+            if let Some(n) = number {
+                db.set_setting(COUNTER, &(n + 1)).map_err(err)?;
             }
         }
         for id in inbox_ids {
@@ -486,13 +530,13 @@ fn after_execution(state: &AppState, cfg: &Config, report: &ops::ExecReport, aft
         }
     }
     for (f, kind) in &touched {
-        refresh_beat_folder(&db, &root, f, *kind).map_err(err)?;
+        refresh_section_item(db, &root, f, *kind).map_err(err)?;
     }
     db.prune().map_err(err)?;
     for (from, _) in report.movements() {
         db.remove_inbox_path(&from.to_string_lossy()).map_err(err)?;
     }
-    Ok(())
+    tx.commit().map_err(err)
 }
 
 fn peaks_to_f32(p: &[u8]) -> Vec<f32> {
@@ -524,7 +568,7 @@ pub fn preview_template(template_id: String, root_name: String) -> CmdResult<Vec
     let example = TokenValues {
         name: "Night".into(),
         bpm: Some(140.0),
-        key: MusicalKey::parse("Am"),
+        key: Some("Am".into()),
         ..Default::default()
     };
     Ok(tpl.preview(&root_name, &example))
@@ -560,13 +604,35 @@ pub async fn plan_create_library(state: State<'_, AppState>, req: OnboardingRequ
 #[tauri::command]
 pub async fn execute_plan(app: AppHandle, state: State<'_, AppState>, plan_id: String) -> CmdResult<ExecResultDto> {
     let pending = state.plans.lock().unwrap().remove(&plan_id).ok_or("this plan has expired, make it again")?;
+    let _io = state.library_io.lock().unwrap();
+    let cfg = state.config();
     let report = {
         let mut db = state.db.lock().unwrap();
-        match ops::execute(&pending.plan, &mut *db, &ExecOptions::default()) {
+        if let AfterExec::SortIntoBeat { folder, new_beat, draft, number, .. } = &pending.after {
+            if let Some(kind) = new_beat.as_ref().map(|m| m.kind).or_else(|| draft.as_ref().map(|d| kind_of(&d.original))) {
+                let (root, _) = library(&cfg)?;
+                let (service, _) = folder.rsplit_once('/').ok_or("stale")?;
+                if beatcore::pathsafe::exists_ignoring_case(&from_rel(&root, service))
+                    || planned_number(&db, &cfg, kind)? != *number {
+                    return Err("stale".into());
+                }
+                if let Some(d) = draft {
+                    let row = db.get_beat(d.id).map_err(err)?.ok_or("stale")?;
+                    let old = &d.original;
+                    if row.folder.is_some() || row.name != old.name || row.key != old.key || row.bpm != old.bpm
+                        || row.authors != old.authors || row.coauthors != old.coauthors || row.kind != old.kind {
+                        return Err("stale".into());
+                    }
+                }
+            }
+        }
+        let report = match ops::execute(&pending.plan, &mut *db, &ExecOptions::default()) {
             Ok(r) => r,
             Err(ExecError::Stale(_)) => return Err("stale".into()),
             Err(e) => return Err(e.to_string()),
-        }
+        };
+        after_execution(&db, &cfg, &report, &pending.after)?;
+        report
     };
 
     if let AfterExec::Onboarding(cfg) = &pending.after {
@@ -574,8 +640,6 @@ pub async fn execute_plan(app: AppHandle, state: State<'_, AppState>, plan_id: S
         allow_scope(&app, cfg);
         restart_watcher(&app, &state, cfg);
     }
-    let cfg = state.config();
-    after_execution(&state, &cfg, &report, &pending.after)?;
     let _ = app.emit("library-changed", ());
     let _ = app.emit("inbox-changed", ());
     if matches!(pending.after, AfterExec::Onboarding(_)) {
@@ -639,16 +703,17 @@ pub fn beat_detail(state: State<'_, AppState>, id: i64) -> CmdResult<BeatDetail>
     let beat = db.get_beat(id).map_err(err)?.ok_or("beat not found")?;
     let assets = db.assets_of_beat(id, cfg.show_backups).map_err(err)?;
     let kind = kind_of(&beat);
-    let expected_parts = tpl.dir_for(kind, &values_for(&beat));
-    let expected = expected_parts.last().cloned().unwrap_or_default();
-    let folder = beat.folder.clone().unwrap_or_default();
-    let current = folder.rsplit('/').next().unwrap_or("").to_string();
-    let right_section = tpl.item_folder_of(&folder).map(|(_, k)| k == kind).unwrap_or(false);
+    let mut expected_parts = tpl.dir_for(kind, &values_for(&beat));
+    let wrong_section = beat.folder.as_deref().and_then(|f| tpl.item_folder_of(f)).is_some_and(|(_, k)| k != kind);
+    if wrong_section {
+        if let Some(folder) = &beat.folder {
+            let leaf = folder.rsplit('/').next().unwrap_or(folder);
+            if tpl.item_folder_of(folder).is_some_and(|(s, _)| s == *folder) { expected_parts.pop(); }
+            expected_parts.push(leaf.to_owned());
+        }
+    }
     Ok(BeatDetail {
-        // An item without a folder yet (a draft) has nothing to rename.
-        folder_matches_template: beat.folder.is_none()
-            || right_section && fold_key(Path::new(&current)) == fold_key(Path::new(&expected)),
-        expected_folder_name: expected,
+        wrong_section,
         expected_folder: expected_parts.join("/"),
         beat: with_abs_cover(beat, &root),
         assets,
@@ -662,23 +727,19 @@ pub async fn plan_align_folder(state: State<'_, AppState>, id: i64, label: Strin
     let (root, tpl) = library(&cfg)?;
     let beat = state.db.lock().unwrap().get_beat(id).map_err(err)?.ok_or("beat not found")?;
     let folder = beat.folder.clone().ok_or("this beat has no folder")?;
-    let abs = from_rel(&root, &folder);
     let kind = kind_of(&beat);
-    let parts = tpl.dir_for(kind, &values_for(&beat));
-    let name = parts.last().cloned().unwrap_or_else(|| "Untitled".into());
+    let (section, old_kind) = tpl.item_folder_of(&folder).ok_or("no_folder")?;
+    if old_kind == kind { return Err("stale".into()); }
+    // A category move keeps the visible folder name for both layouts.
+    let src = from_rel(&root, &section);
+    let mut parts = tpl.dir_for(kind, &values_for(&beat));
+    let template_leaf = parts.pop().ok_or("bad_pattern")?;
+    let parent = from_rel(&root, &parts.join("/"));
+    let leaf = if section == folder { src.file_name().and_then(|s| s.to_str()).ok_or("no_folder")? } else { &template_leaf };
+    let dest = parent.join(unique_name(&parent, leaf, &HashSet::new()));
     let mut b = PlanBuilder::new(label, cfg.plan_roots());
-    let right_section = tpl.item_folder_of(&folder).map(|(_, k)| k == kind).unwrap_or(false);
-    if right_section {
-        // Same section: only the folder name changes, parents (year) stay.
-        b.move_item(&abs, abs.with_file_name(name));
-    } else {
-        // Kind changed (beat ↔ loop ↔ starter): move into the other section.
-        let dest = from_rel(&root, &parts.join("/"));
-        if let Some(parent) = dest.parent() {
-            b.create_dir(parent);
-        }
-        b.move_item(&abs, dest);
-    }
+    b.create_dir(parent);
+    b.move_item(src, dest);
     Ok(register(&state, b.build(), AfterExec::Nothing, &cfg))
 }
 
@@ -707,6 +768,17 @@ pub fn set_inbox_ignored(app: AppHandle, state: State<'_, AppState>, ids: Vec<i6
     Ok(())
 }
 
+fn inbox_name(item: &InboxItem) -> String {
+    let p = Path::new(&item.path);
+    if let Some(name) = &item.folder_name {
+        name.clone()
+    } else if p.is_dir() {
+        item.name.clone()
+    } else {
+        beatcore::scan::display_stem(p)
+    }
+}
+
 #[tauri::command]
 pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResult<PlanView> {
     let cfg = state.config();
@@ -723,16 +795,21 @@ pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResul
     }
 
     let mut draft = None;
-    let (folder_rel, values, new_beat, item_kind) = match &req.target {
+    let mut number = None;
+    let (folder_rel, _values, new_beat, item_kind) = match &req.target {
         SortTarget::Existing { beat_id } => {
             let beat = db.get_beat(*beat_id).map_err(err)?.ok_or("beat not found")?;
-            let first = PathBuf::from(&items[0].path);
-            let (folder, values, kind, fill) = existing_target(&tpl, &root, &db, &beat, Some(&first))?;
+            let first = inbox_name(&items[0]);
+            if beat.folder.is_none() { number = planned_number(&db, &cfg, kind_of(&beat))?; }
+            let (folder, values, kind, fill) = existing_target(&tpl, &root, &db, &beat, Some(&first), number)?;
             draft = fill;
             (folder, values, None, kind)
         }
         SortTarget::New { name, bpm, key, kind, authors, coauthors } => {
-            let (folder, values, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors)?;
+            number = planned_number(&db, &cfg, kind.as_deref().and_then(ItemKind::parse).unwrap_or(ItemKind::Beat))?;
+            let source = inbox_name(&items[0]);
+            let user = if items[0].title.as_deref() == Some(name.as_str()) { &source } else { name };
+            let (folder, values, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors, user, number)?;
             let kind = meta.kind;
             (folder, values, Some(meta), kind)
         }
@@ -742,6 +819,9 @@ pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResul
     let beat_abs = from_rel(&root, &folder_rel);
     let mut b = PlanBuilder::new(req.label, cfg.plan_roots());
     let mut taken: HashSet<String> = HashSet::new();
+    if draft.is_some() || new_beat.is_some() {
+        plan_layout(&mut b, &beat_abs);
+    }
     for item in &items {
         let src = PathBuf::from(&item.path);
         if !item_kind.accepts(AssetKind::from_str(&item.kind), &src) {
@@ -756,29 +836,13 @@ pub async fn plan_sort(state: State<'_, AppState>, req: SortRequest) -> CmdResul
         };
         b.create_dir(&dest_dir);
         let original = src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let name = if req.rename && !item.is_dir {
-            let ext = src.extension().map(|e| e.to_string_lossy().to_string());
-            let stem = tpl.file_name_for(&values, None);
-            // "tag" in a voice tag's file name is its subject, not a "tagged" marker.
-            let stem = match parse_name(&original).tagged.filter(|_| !item_kind.is_flat()) {
-                Some(true) => format!("{stem}_tagged"),
-                Some(false) => format!("{stem}_untagged"),
-                None => stem,
-            };
-            sanitize_component(&match ext {
-                Some(e) => format!("{stem}.{e}"),
-                None => stem,
-            })
-        } else {
-            sanitize_component(&original)
-        };
-        let name = unique_name(&dest_dir, &name, &taken);
+        let name = unique_name(&dest_dir, &original, &taken);
         let dest = dest_dir.join(&name);
         taken.insert(fold_key(&dest));
         b.move_item(src, dest);
     }
     let plan = b.build();
-    let after = AfterExec::SortIntoBeat { folder: folder_rel, new_beat, inbox_ids: req.inbox_ids.clone(), draft };
+    let after = AfterExec::SortIntoBeat { folder: folder_rel, new_beat, inbox_ids: req.inbox_ids.clone(), draft, number };
     Ok(register(&state, plan, after, &cfg))
 }
 
@@ -873,7 +937,8 @@ pub fn reveal(app: AppHandle, state: State<'_, AppState>, target: RevealTarget) 
         RevealTarget::Asset { id } => asset_abs(&state, id)?.1,
         RevealTarget::Beat { id } => {
             let beat = state.db.lock().unwrap().get_beat(id).map_err(err)?.ok_or("beat not found")?;
-            from_rel(&root, beat.folder.as_deref().ok_or("this beat has no folder")?)
+            let path = from_rel(&root, beat.folder.as_deref().ok_or("this beat has no folder")?);
+            return app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(err);
         }
         RevealTarget::Inbox { id } => {
             PathBuf::from(state.db.lock().unwrap().inbox_item(id).map_err(err)?.ok_or("item not found")?.path)
@@ -885,7 +950,15 @@ pub fn reveal(app: AppHandle, state: State<'_, AppState>, target: RevealTarget) 
 
 #[tauri::command]
 pub fn set_prefs(state: State<'_, AppState>, patch: PrefsPatch) -> CmdResult<Config> {
-    let mut cfg = state.config();
+    let db = state.db.lock().unwrap();
+    let tx = db.conn.unchecked_transaction().map_err(err)?;
+    let mut cfg = db.get_setting::<Config>(crate::state::CONFIG_KEY).map_err(err)?.unwrap_or_default();
+    if let Some(n) = patch.number_from {
+        if n > MAX_NUMBER { return Err("number_limit".into()); }
+        cfg.number_from = n;
+        db.set_setting(COUNTER, &n).map_err(err)?;
+    }
+    if let Some(on) = patch.number_beats { cfg.number_beats = on; }
     if let Some(l) = patch.lang.filter(|l| l == "ru" || l == "en") {
         cfg.lang = l;
     }
@@ -898,7 +971,8 @@ pub fn set_prefs(state: State<'_, AppState>, patch: PrefsPatch) -> CmdResult<Con
     if let Some(n) = patch.producer_name {
         cfg.producer_name = n.map(|n| n.replace(',', " ").trim().to_string()).filter(|n| !n.is_empty());
     }
-    state.save_config(&cfg)?;
+    db.set_setting(crate::state::CONFIG_KEY, &cfg).map_err(err)?;
+    tx.commit().map_err(err)?;
     Ok(cfg)
 }
 
@@ -909,7 +983,8 @@ pub fn set_watch_folders(
     fl: Vec<String>,
     ableton: Vec<String>,
 ) -> CmdResult<Config> {
-    let mut cfg = state.config();
+    let db = state.db.lock().unwrap();
+    let mut cfg = db.get_setting::<Config>(crate::state::CONFIG_KEY).map_err(err)?.unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let merge = |old: &Vec<WatchFolder>, new: &Vec<String>| -> Vec<WatchFolder> {
         new.iter()
@@ -919,10 +994,18 @@ pub fn set_watch_folders(
     };
     cfg.fl_folders = merge(&cfg.fl_folders, &fl);
     cfg.ableton_folders = merge(&cfg.ableton_folders, &ableton);
-    state.save_config(&cfg)?;
+    db.set_setting(crate::state::CONFIG_KEY, &cfg).map_err(err)?;
+    drop(db);
     allow_scope(&app, &cfg);
     restart_watcher(&app, &state, &cfg);
     Ok(cfg)
+}
+
+#[tauri::command]
+pub async fn scan_daw(state: State<'_, AppState>) -> CmdResult<()> {
+    let done = state.watcher.lock().unwrap().as_ref().ok_or("daw_unavailable")?.rescan()?;
+    tauri::async_runtime::spawn_blocking(move || done.recv().map_err(|_| "daw_unavailable".to_owned()))
+        .await.map_err(err)??
 }
 
 #[tauri::command]
@@ -946,6 +1029,7 @@ pub struct DropItem {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DropDto {
+    pub folder_suggestion: Option<ImportSuggestion>,
     pub drop_id: String,
     pub items: Vec<DropItem>,
 }
@@ -957,6 +1041,11 @@ enum DragFilesEvent {
     Over { x: f64, y: f64 },
     Leave,
     Drop { x: f64, y: f64, drop: DropDto },
+}
+
+fn source_stem(p: &Path) -> String {
+    let name = if p.is_dir() { p.file_name() } else { p.file_stem() };
+    name.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn kind_of_path(p: &Path) -> AssetKind {
@@ -993,12 +1082,14 @@ fn register_drop(state: &AppState, paths: Vec<PathBuf>) -> Option<DropDto> {
             }
         })
         .collect();
+    let folder_suggestion = paths.first().filter(|p| p.is_dir())
+        .map(|p| import_suggestion(source_stem(p), true, beatcore::daw::is_ableton_project_dir(p)));
     let mut drops = state.drops.lock().unwrap();
     if drops.len() > 20 {
         drops.clear();
     }
     drops.insert(drop_id.clone(), paths);
-    Some(DropDto { drop_id, items })
+    Some(DropDto { drop_id, items, folder_suggestion })
 }
 
 fn uuid_like() -> String {
@@ -1061,6 +1152,7 @@ pub enum AddTarget {
 #[serde(rename_all = "camelCase")]
 pub struct AddFilesRequest {
     pub drop_id: String,
+    pub user_folder: Option<String>,
     pub target: AddTarget,
     /// Item index → slot; only for `Beat`.
     #[serde(default)]
@@ -1085,19 +1177,25 @@ pub async fn plan_add_files(state: State<'_, AppState>, req: AddFilesRequest) ->
             let kind = kind_of(&beat);
             // A draft is named after the first file it can actually take.
             let first = paths.iter().find(|p| kind.accepts(kind_of_path(p), p)).or(paths.first());
-            let (folder, _, kind, fill) = existing_target(&tpl, &root, &db, &beat, first.map(|p| p.as_path()))?;
+            let number = if beat.folder.is_none() { planned_number(&db, &cfg, kind)? } else { None };
+            let source = req.user_folder.clone().or_else(|| first.map(|p| source_stem(p)));
+            let (folder, _, kind, fill) = existing_target(&tpl, &root, &db, &beat, source.as_deref(), number)?;
             let abs = from_rel(&root, &folder);
             if fill.is_some() {
-                after = AfterExec::SortIntoBeat { folder, new_beat: None, inbox_ids: vec![], draft: fill };
+                plan_layout(&mut b, &abs);
+                after = AfterExec::SortIntoBeat { folder, new_beat: None, inbox_ids: vec![], draft: fill, number };
             }
             Some((abs, kind))
         }
         AddTarget::Inbox => None,
         AddTarget::New { name, bpm, key, kind, authors, coauthors } => {
-            let (folder, _, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors)?;
+            let number = planned_number(&state.db.lock().unwrap(), &cfg, kind.as_deref().and_then(ItemKind::parse).unwrap_or(ItemKind::Beat))?;
+            let user = req.user_folder.as_deref().unwrap_or(name);
+            let (folder, _, meta) = new_item(&cfg, &tpl, name, *bpm, key.as_deref(), kind.as_deref(), authors, coauthors, user, number)?;
             let abs = from_rel(&root, &folder);
             let kind = meta.kind;
-            after = AfterExec::SortIntoBeat { folder, new_beat: Some(meta), inbox_ids: vec![], draft: None };
+            plan_layout(&mut b, &abs);
+            after = AfterExec::SortIntoBeat { folder, new_beat: Some(meta), inbox_ids: vec![], draft: None, number };
             Some((abs, kind))
         }
     };
@@ -1120,7 +1218,7 @@ pub async fn plan_add_files(state: State<'_, AppState>, req: AddFilesRequest) ->
         };
         b.create_dir(&dest_dir);
         let original = src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let name = unique_name(&dest_dir, &sanitize_component(&original), &taken);
+        let name = unique_name(&dest_dir, &original, &taken);
         let dest = dest_dir.join(&name);
         taken.insert(fold_key(&dest));
         b.copy_item(src.clone(), dest);
@@ -1250,7 +1348,7 @@ pub fn render_preview(state: State<'_, AppState>, pattern: String) -> CmdResult<
     let v = TokenValues {
         name: "Night".into(),
         bpm: Some(140.0),
-        key: MusicalKey::parse("Am"),
+        key: Some("Am".into()),
         authors: vec![me],
         coauthors: vec!["lowkey".into()],
         ..Default::default()
@@ -1467,11 +1565,30 @@ pub async fn export_mp3(app: AppHandle, id: i64, title: String) -> CmdResult<Opt
 #[serde(rename_all = "camelCase")]
 pub struct ImportDto {
     pub drop: DropDto,
-    /// Name, BPM, key and credits read from the folder or file name.
+    #[serde(flatten)]
+    pub suggestion: ImportSuggestion,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSuggestion {
+    pub user_folder: String,
     pub name: String,
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub authors: Vec<String>,
+}
+
+fn import_suggestion(original: String, folder: bool, live: bool) -> ImportSuggestion {
+    let source = if live { original.strip_suffix(" Project").unwrap_or(&original) } else { &original };
+    let parsed = if folder { parse_folder_name(source) } else { parse_name(source) };
+    ImportSuggestion {
+        name: if parsed.title.trim().is_empty() { original.clone() } else { parsed.title },
+        user_folder: original,
+        bpm: parsed.bpm.map(f64::from),
+        key: parsed.key.map(|k| k.name().to_owned()),
+        authors: parsed.producers,
+    }
 }
 
 const IMPORT_MAX_ITEMS: usize = 200;
@@ -1495,7 +1612,6 @@ pub async fn pick_import(app: AppHandle, folder: bool, title: String) -> CmdResu
         let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         if beatcore::daw::is_ableton_project_dir(&dir) {
             // An Ableton project travels as one piece.
-            let name = name.strip_suffix(" Project").unwrap_or(&name).to_string();
             (vec![dir], name)
         } else {
             let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1527,14 +1643,8 @@ pub async fn pick_import(app: AppHandle, folder: bool, title: String) -> CmdResu
     let Some(drop) = register_drop(&state, paths) else {
         return Err("empty_folder".into());
     };
-    let parsed = parse_name(&source_name);
-    Ok(Some(ImportDto {
-        drop,
-        name: if parsed.title.trim().is_empty() { source_name } else { parsed.title },
-        bpm: parsed.bpm.map(|b| b as f64),
-        key: parsed.key.map(|k| k.name().to_string()),
-        authors: parsed.producers,
-    }))
+    let live = folder && drop.items.len() == 1 && drop.items[0].kind == "ableton_project" && drop.items[0].name == source_name;
+    Ok(Some(ImportDto { drop, suggestion: import_suggestion(source_name, folder, live) }))
 }
 
 // ───────────────────────────── delete an item ─────────────────────────────
@@ -1545,7 +1655,7 @@ pub async fn pick_import(app: AppHandle, folder: bool, title: String) -> CmdResu
 #[tauri::command]
 pub async fn plan_delete_item(state: State<'_, AppState>, id: i64, label: String) -> CmdResult<PlanView> {
     let cfg = state.config();
-    let (root, _) = library(&cfg)?;
+    let (root, tpl) = library(&cfg)?;
     let beat = state.db.lock().unwrap().get_beat(id).map_err(err)?.ok_or("beat not found")?;
     let abs = from_rel(&root, beat.folder.as_deref().ok_or("no_folder")?);
     let files = walkdir::WalkDir::new(&abs)
@@ -1558,7 +1668,11 @@ pub async fn plan_delete_item(state: State<'_, AppState>, id: i64, label: String
     if files > 0 {
         b.warn(Issue::new(ops::IssueCode::DeletesFiles, &abs).detail(files.to_string()));
     }
-    b.trash_item(abs);
+    b.trash_item(abs.clone());
+    let folder = beat.folder.as_deref().unwrap();
+    if let Some((service, _)) = tpl.item_folder_of(folder) {
+        if service != folder { b.remove_empty_dir(from_rel(&root, &service)); }
+    }
     Ok(register(&state, b.build(), AfterExec::Nothing, &cfg))
 }
 
@@ -1617,20 +1731,20 @@ mod draft_target_tests {
         let id = db.create_draft("Без названия", "beat", &["maks".into()]).unwrap();
         let beat = db.get_beat(id).unwrap().unwrap();
         let first = Path::new("C:/Downloads/Night_140bpm_Am.wav");
-        let (folder, _, kind, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
+        let (folder, _, kind, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(&source_stem(first)), None).unwrap();
         let fill = fill.expect("a draft is filled in");
         assert_eq!(kind, ItemKind::Beat);
         assert_eq!(fill.name, "Night");
         assert_eq!(fill.bpm, Some(140.0));
-        assert_eq!(fill.key.map(|k| k.name().to_string()).as_deref(), Some("Am"));
+        assert_eq!(fill.key.as_deref(), Some("Am"));
         assert_eq!(fill.authors, vec!["maks"]);
-        assert_eq!(folder, format!("01_Beats/{year}/Night_140bpm_Am"));
+        assert_eq!(folder, format!("01_Beats/{year}/Night_140bpm_Am/Night_140bpm_Am"));
 
         // A plain name is taken whole, minus the extension.
         let (folder, _, _, fill) =
-            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Тёмный лес.mp3"))).unwrap();
+            existing_target(&tpl, dir.path(), &db, &beat, Some("Тёмный лес"), None).unwrap();
         assert_eq!(fill.unwrap().name, "Тёмный лес");
-        assert_eq!(folder, format!("01_Beats/{year}/Тёмный лес"));
+        assert_eq!(folder, format!("01_Beats/{year}/Тёмный лес/Тёмный лес"));
     }
 
     #[test]
@@ -1640,15 +1754,15 @@ mod draft_target_tests {
         db.update_beat(id, &BeatPatch { name: Some("Мой бит".into()), ..Default::default() }).unwrap();
         let beat = db.get_beat(id).unwrap().unwrap();
         let first = Path::new("/x/Night_140bpm_Am.wav");
-        let (folder, _, _, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
+        let (folder, _, _, fill) = existing_target(&tpl, dir.path(), &db, &beat, Some(&source_stem(first)), None).unwrap();
         let fill = fill.unwrap();
         assert_eq!(fill.name, "Мой бит");
-        assert_eq!(fill.bpm, Some(140.0), "BPM and key are still read from the file");
-        assert_eq!(folder, format!("01_Beats/{year}/Мой бит_140bpm_Am"));
+        assert_eq!(fill.bpm, Some(140.0), "BPM and key are still read from the first source");
+        assert_eq!(folder, format!("01_Beats/{year}/Мой бит_140bpm_Am/Мой бит"));
 
         std::fs::create_dir_all(dir.path().join(&folder)).unwrap();
-        let (again, _, _, _) = existing_target(&tpl, dir.path(), &db, &beat, Some(first)).unwrap();
-        assert_eq!(again, format!("01_Beats/{year}/Мой бит_140bpm_Am (2)"));
+        let (again, _, _, _) = existing_target(&tpl, dir.path(), &db, &beat, Some(&source_stem(first)), None).unwrap();
+        assert_eq!(again, format!("01_Beats/{year}/Мой бит_140bpm_Am (2)/Мой бит"));
     }
 
     #[test]
@@ -1657,15 +1771,15 @@ mod draft_target_tests {
         let id = db.create_draft("Без названия", "voicetag", &[]).unwrap();
         let beat = db.get_beat(id).unwrap().unwrap();
         let (folder, _, kind, fill) =
-            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Maks Tag.wav"))).unwrap();
+            existing_target(&tpl, dir.path(), &db, &beat, Some("Maks Tag"), None).unwrap();
         assert_eq!(kind, ItemKind::Voicetag);
         assert_eq!(fill.unwrap().name, "Maks Tag");
-        assert_eq!(folder, "07_Voicetags/Maks Tag");
+        assert_eq!(folder, "07_Voicetags/Maks Tag/Maks Tag");
 
         db.adopt_draft(id, &folder).unwrap();
         let beat = db.get_beat(id).unwrap().unwrap();
         let (same, _, _, fill) =
-            existing_target(&tpl, dir.path(), &db, &beat, Some(Path::new("/x/Other.wav"))).unwrap();
+            existing_target(&tpl, dir.path(), &db, &beat, Some("Other"), None).unwrap();
         assert_eq!(same, folder);
         assert!(fill.is_none(), "an item that has a folder keeps its name");
     }

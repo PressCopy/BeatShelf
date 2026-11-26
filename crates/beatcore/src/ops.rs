@@ -36,6 +36,8 @@ use std::time::{Duration, SystemTime};
 pub enum Step {
     /// Ensure the folder exists (parents included).
     CreateDir { path: PathBuf },
+    /// Atomically claim a fresh service directory. Its parent must exist.
+    CreateNewDir { path: PathBuf },
     /// Move or rename a file or a whole folder.
     Move { from: PathBuf, to: PathBuf },
     /// Remove a folder only if it is empty (used by undo).
@@ -148,6 +150,11 @@ impl PlanBuilder {
     }
     pub fn create_dir(&mut self, p: impl Into<PathBuf>) -> &mut Self {
         self.steps.push(Step::CreateDir { path: p.into() });
+        self
+    }
+    pub fn create_new_dir(&mut self, p: &Path) -> &mut Self {
+        if let Some(parent) = p.parent() { self.create_dir(parent); }
+        self.steps.push(Step::CreateNewDir { path: p.to_path_buf() });
         self
     }
     pub fn move_item(&mut self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) -> &mut Self {
@@ -277,7 +284,10 @@ fn validate(steps: &[Step], roots: &[PathBuf], with_warnings: bool) -> Validatio
 
     for step in steps {
         match step {
-            Step::CreateDir { path } => {
+            Step::CreateNewDir { path } if v.exists(path) => {
+                out.blockers.push(Issue::new(IssueCode::DestinationExists, path));
+            }
+            Step::CreateDir { path } | Step::CreateNewDir { path } => {
                 if !within_roots(path, roots) {
                     out.blockers.push(Issue::new(IssueCode::OutsideLibrary, path));
                     continue;
@@ -779,6 +789,8 @@ pub fn execute(plan: &Plan, journal: &mut dyn Journal, opts: &ExecOptions) -> st
         } else {
             match step {
                 Step::CreateDir { path } => do_create_dir(path),
+                Step::CreateNewDir { path } => fs::create_dir(path)
+                    .map(|()| vec![DoneOp::CreatedDir { path: path.clone() }]).map_err(Error::from),
                 Step::Move { from, to } => do_move(from, to, opts).map(|op| vec![op]),
                 Step::Copy { from, to } => copy_verified(from, to)
                     .map(|_| vec![DoneOp::Copied { from: from.clone(), to: to.clone() }]),

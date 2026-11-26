@@ -1,6 +1,6 @@
 [package]
 name = "beatshelf"
-version = "0.7.0"
+version = "0.7.1"
 description = "Beat organizer for FL Studio and Ableton Live producers"
 edition = "2021"
 license = "MIT"
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = "2.7.4"
 
 [dependencies]
-beatcore = { version = "0.7.0", path = "../crates/beatcore" }
+beatcore = { version = "0.7.1", path = "../crates/beatcore" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 drag = "2"
 log = "0.4.35"

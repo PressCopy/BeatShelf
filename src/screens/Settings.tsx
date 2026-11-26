@@ -1,126 +1,38 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FolderOpen, Plus, RefreshCw, X } from "lucide-react";
 import { api, errorText, pickFolder } from "../api";
 import { useStore } from "../store";
 import { Button, IconButton, Label, Segmented, TextInput } from "../components/ui";
-import { useDebounced } from "../lib/useEvents";
-import type { Config, Lang, LibraryTemplate, TemplatePatch, ThemePref } from "../types";
+import type { Config, Lang, ThemePref } from "../types";
 
-const TOKENS = ["name", "bpm", "key", "camelot", "year", "date", "authors", "coauthors", "producers"] as const;
-type PatternField = "fileName" | "beatDir" | "loopDir" | "starterDir" | "voicetagDir";
-const FIELDS: { field: PatternField; label: string }[] = [
-  { field: "fileName", label: "settings.fileName" },
-  { field: "beatDir", label: "settings.beatFolder" },
-  { field: "loopDir", label: "settings.loopFolder" },
-  { field: "starterDir", label: "settings.starterFolder" },
-  { field: "voicetagDir", label: "settings.voicetagFolder" },
-];
-
-function Preview({ pattern }: { pattern: string }) {
+function Numbering({ config, save }: { config: Config; save: (p: Parameters<typeof api.setPrefs>[0]) => Promise<void> }) {
   const { t } = useTranslation();
-  const debounced = useDebounced(pattern, 200);
-  const [out, setOut] = useState("");
-  useEffect(() => {
-    let alive = true;
-    api.renderPreview(debounced).then((r) => alive && setOut(r)).catch(() => alive && setOut(""));
-    return () => {
-      alive = false;
-    };
-  }, [debounced]);
+  const [number, setNumber] = useState(String(config.numberFrom));
+  useEffect(() => setNumber(String(config.numberFrom)), [config.numberFrom]);
   return (
-    <div className="mt-1 truncate text-cap text-muted" title={out}>
-      {t("settings.example")}: <span className="text-text">{out}</span>
-    </div>
-  );
-}
-
-/** Patterns for file and folder names, with token buttons and a live example. */
-function TemplateEditor({ template, onSaved }: { template: LibraryTemplate; onSaved: (c: Config) => void }) {
-  const { t } = useTranslation();
-  const notify = useStore((s) => s.notify);
-  const [values, setValues] = useState<Record<PatternField, string>>({
-    fileName: template.fileName,
-    beatDir: template.beatDir,
-    loopDir: template.loopDir,
-    starterDir: template.starterDir,
-    voicetagDir: template.voicetagDir,
-  });
-  const [error, setError] = useState<string | null>(null);
-  const focused = useRef<{ field: PatternField; el: HTMLInputElement } | null>(null);
-
-  const insert = (text: string) => {
-    const f = focused.current;
-    const field = f?.field ?? "fileName";
-    const current = values[field];
-    const start = f?.el.selectionStart ?? current.length;
-    const end = f?.el.selectionEnd ?? current.length;
-    const next = current.slice(0, start) + text + current.slice(end);
-    setValues({ ...values, [field]: next });
-    requestAnimationFrame(() => {
-      if (!f) return;
-      f.el.focus();
-      f.el.setSelectionRange(start + text.length, start + text.length);
-    });
-  };
-
-  const changed = (Object.keys(values) as PatternField[]).filter((k) => values[k] !== template[k]);
-  const save = async () => {
-    setError(null);
-    const patch: TemplatePatch = {};
-    for (const k of changed) patch[k] = values[k];
-    try {
-      onSaved(await api.updateTemplate(patch));
-      notify(t("settings.templateSaved"));
-    } catch (e) {
-      const code = errorText(e);
-      setError(code === "bad_pattern" || code === "structure_locked" ? t(`settings.errors.${code}`) : code);
-    }
-  };
-
-  return (
-    <section className="mb-8">
-      <Label hint={t("settings.namesHint")}>{t("settings.names")}</Label>
-      <div className="mb-3 flex flex-wrap gap-1.5">
-        {TOKENS.map((tok) => (
-          <button
-            key={tok}
-            type="button"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => insert(`{${tok}}`)}
-            className="h-7 rounded-md border border-line px-2 text-cap hover:bg-raised"
-          >
-            {t(`settings.tokens.${tok}`)}
-          </button>
-        ))}
-        <button
-          type="button"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => insert("[ (prod. {producers})]")}
-          className="h-7 rounded-md border border-dashed border-line px-2 text-cap hover:bg-raised"
-        >
-          [ (prod. …)]
-        </button>
-      </div>
-      <div className="flex flex-col gap-4">
-        {FIELDS.map(({ field, label }) => (
-          <label key={field} className="block">
-            <span className="mb-1 block font-medium">{t(label)}</span>
-            <TextInput
-              value={values[field]}
-              spellCheck={false}
-              className="font-mono"
-              onFocus={(e) => (focused.current = { field, el: e.currentTarget })}
-              onChange={(e) => setValues({ ...values, [field]: e.target.value })}
-            />
-            <Preview pattern={values[field]} />
-          </label>
-        ))}
-      </div>
-      {error && <p className="mt-3 text-danger" role="alert">{error}</p>}
-      <Button tone="primary" className="mt-4" disabled={changed.length === 0} onClick={() => void save()}>
-        {t("settings.saveTemplate")}
-      </Button>
+    <section className="mb-8 flex flex-col items-start gap-3">
+      <label className="flex items-center gap-2">
+        <input type="checkbox" role="switch" checked={config.numberBeats}
+          className="peer sr-only" onChange={(e) => void save({ numberBeats: e.target.checked })} />
+        <span aria-hidden="true" className="flex h-5 w-9 items-center rounded-full bg-raised px-0.5 ring-1 ring-line peer-checked:bg-primary-bg peer-focus-visible:outline-2">
+          <span className={`h-4 w-4 rounded-full transition-transform ${config.numberBeats ? "translate-x-4 bg-primary-fg" : "bg-muted"}`} />
+        </span>
+        {t("settings.numberBeats")}
+      </label>
+      <label className="flex items-center gap-3 whitespace-nowrap">{t("settings.numberFrom")}
+        <span className="w-24">
+        <TextInput type="number" min={0} step={1} className="num" value={number}
+          onChange={(e) => setNumber(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+          onBlur={() => {
+            const n = Number(number);
+            if (!number || !Number.isSafeInteger(n) || n < 0) setNumber(String(config.numberFrom));
+            else if (n !== config.numberFrom) void save({ numberFrom: n });
+          }}
+        />
+        </span>
+      </label>
     </section>
   );
 }
@@ -187,6 +99,18 @@ export function Settings() {
   const config = useStore((s) => s.app?.config);
   const setConfig = useStore((s) => s.setConfig);
   const notify = useStore((s) => s.notify);
+  const [scanningDaw, setScanningDaw] = useState(false);
+  const scanDaw = async () => {
+    setScanningDaw(true);
+    try {
+      await api.scanDaw();
+      notify(t("settings.dawDone"));
+    } catch (e) {
+      notify(t("settings.dawFailed", { message: errorText(e) }), "error");
+    } finally {
+      setScanningDaw(false);
+    }
+  };
   if (!config) return null;
 
   const prefs = async (patch: Parameters<typeof api.setPrefs>[0]) => {
@@ -253,12 +177,16 @@ export function Settings() {
           </Button>
         </section>
 
-        {config.template && <TemplateEditor template={config.template} onSaved={setConfig} />}
+        <Numbering config={config} save={prefs} />
 
         <section className="mb-8">
           <Label hint={t("settings.watchHint")}>{t("onboarding.daws")}</Label>
           <FolderList title={t("settings.flFolders")} folders={fl} onChange={(n) => void watch(n, ab)} />
           <FolderList title={t("settings.abletonFolders")} folders={ab} onChange={(n) => void watch(fl, n)} />
+          <Button onClick={() => void scanDaw()} disabled={scanningDaw || !(fl.length || ab.length)}>
+            <RefreshCw size={14} className={scanningDaw ? "animate-spin" : ""} />
+            {t("settings.scanDaw")}
+          </Button>
         </section>
 
         <section>

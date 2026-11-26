@@ -52,9 +52,8 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
   const [name, setName] = useState(first?.title ?? "");
   const [bpm, setBpm] = useState(formatBpm(items.find((i) => i.bpm != null)?.bpm));
   const [key, setKey] = useState(items.find((i) => i.key)?.key ?? "");
-  const [rename, setRename] = useState(true);
   const [kind, setKind] = useState<ItemKind>("beat");
-  const [authors, setAuthors] = useState(useStore.getState().app?.config.producerName ?? "");
+  const [authors, setAuthors] = useState(first?.authors?.join(", ") || useStore.getState().app?.config.producerName || "");
   const [coauthors, setCoauthors] = useState("");
   const [slots, setSlots] = useState<Record<string, Slot>>(() =>
     Object.fromEntries(items.map((i) => [String(i.id), defaultSlot(i.kind, i.name)])),
@@ -86,9 +85,9 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
       const people = (v: string) => v.split(",").map((x) => x.trim()).filter(Boolean);
       target = {
         type: "new" as const,
-        name: name.trim(),
+        name,
         bpm: kind === "voicetag" ? null : n,
-        key: kind === "voicetag" ? null : key.trim() || null,
+        key: kind === "voicetag" ? null : key || null,
         kind,
         authors: kind === "voicetag" ? [] : people(authors),
         coauthors: kind === "voicetag" ? [] : people(coauthors),
@@ -102,7 +101,7 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
     }
     setBusy(true);
     try {
-      const plan = await api.planSort({ inboxIds: items.map((i) => i.id), target, rename, slots, label });
+      const plan = await api.planSort({ inboxIds: items.map((i) => i.id), target, slots, label });
       onClose();
       showPlan(plan, onPlanned);
     } catch (e) {
@@ -146,7 +145,7 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
               setKind(k);
               // "Maks Tag.wav" is parsed as title "Maks" + a "tagged" marker;
               // for a voice tag the whole file name is the name.
-              if (k === "voicetag" && first && name === (first.title ?? "")) setName(first.name.replace(/\.[^.]+$/, ""));
+              if (k === "voicetag" && first && name === (first.title ?? "")) setName(first.folderName ?? first.name.replace(/\.[^.]+$/, ""));
             }}
             options={KINDS.map((k) => ({ value: k, label: t(`item.${k}`) }))}
           />
@@ -198,14 +197,6 @@ function SortDialog({ items, onClose, onPlanned }: { items: InboxItem[]; onClose
           </ul>
         </div>
       )}
-
-      <label className="mb-6 flex items-start gap-2">
-        <input type="checkbox" className="mt-1" checked={rename} onChange={(e) => setRename(e.target.checked)} />
-        <span>
-          <span className="block">{t("sort.rename")}</span>
-          <span className="block text-cap text-muted">{t("sort.renameHint")}</span>
-        </span>
-      </label>
 
       {flat ? <p className="mb-2 text-muted">{t("sort.voicetagHint")}</p> : <Label>{t("sort.whereEach")}</Label>}
       <ul className="flex flex-col gap-1">

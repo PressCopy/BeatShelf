@@ -27,6 +27,7 @@ pub fn run() {
                 plans: Mutex::new(HashMap::new()),
                 watcher: Mutex::new(None),
                 scanning: AtomicBool::new(false),
+                library_io: Mutex::new(()),
                 drops: Mutex::new(HashMap::new()),
                 dragging_out: AtomicBool::new(false),
             });
@@ -67,6 +68,7 @@ pub fn run() {
             commands::set_prefs,
             commands::set_watch_folders,
             commands::rescan,
+            commands::scan_daw,
             commands::pick_files,
             commands::plan_add_files,
             commands::start_drag,

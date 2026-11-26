@@ -60,7 +60,7 @@ export const api = {
   inboxMedia: (id: number) => invoke<Media>("inbox_media", { id }),
   reveal: (target: RevealTarget) => invoke<void>("reveal", { target }),
 
-  setPrefs: (patch: Partial<Pick<Config, "lang" | "theme" | "showBackups" | "producerName">>) =>
+  setPrefs: (patch: Partial<Pick<Config, "lang" | "theme" | "showBackups" | "producerName" | "numberBeats" | "numberFrom">>) =>
     invoke<Config>("set_prefs", { patch }),
   updateTemplate: (patch: TemplatePatch) => invoke<Config>("update_template", { patch }),
   renderPreview: (pattern: string) => invoke<string>("render_preview", { pattern }),
@@ -75,7 +75,7 @@ export const api = {
   planDeleteItem: (id: number, label: string) => invoke<PlanView>("plan_delete_item", { id, label }),
   /** "Add folder" / "Add files": a folder's contents (or loose files) for one new item. */
   pickImport: (folder: boolean, title: string) => invoke<ImportDto | null>("pick_import", { folder, title }),
-  planAddFiles: (req: { dropId: string; target: AddTarget; slots: Record<string, string>; label: string }) =>
+  planAddFiles: (req: { dropId: string; userFolder?: string; target: AddTarget; slots: Record<string, string>; label: string }) =>
     invoke<PlanView>("plan_add_files", { req }),
   /** Native drag of a library file out of the window (always a copy). */
   startDrag: (target: { type: "asset"; id: number } | { type: "beat"; id: number }) =>
@@ -94,6 +94,7 @@ export const api = {
   libraryCounts: () => invoke<Record<ItemKind, number>>("library_counts"),
   setWatchFolders: (fl: string[], ableton: string[]) =>
     invoke<Config>("set_watch_folders", { fl, ableton }),
+  scanDaw: () => invoke<void>("scan_daw"),
   rescan: () => invoke<void>("rescan"),
 };
 
