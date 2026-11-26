@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths: ["src-tauri/tauri.conf.json"]
+    paths: ["src-tauri/tauri.conf.json", ".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -49,7 +49,7 @@ jobs:
           - name: macOS universal
             runner: macos-latest
             targets: aarch64-apple-darwin,x86_64-apple-darwin
-            args: --target universal-apple-darwin --bundles dmg
+            args: --target universal-apple-darwin --bundles app,dmg
             artifact: macos
           - name: Windows x64
             runner: windows-latest
